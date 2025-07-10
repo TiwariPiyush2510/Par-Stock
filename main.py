@@ -5,7 +5,6 @@ from io import BytesIO
 
 app = FastAPI()
 
-# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,36 +15,41 @@ app.add_middleware(
 
 @app.post("/calculate")
 async def calculate_par_stock(weekly_file: UploadFile = File(...), monthly_file: UploadFile = File(...)):
-    try:
-        # Read uploaded files
-        weekly_content = await weekly_file.read()
-        monthly_content = await monthly_file.read()
-        weekly_df = pd.read_excel(BytesIO(weekly_content))
-        monthly_df = pd.read_excel(BytesIO(monthly_content))
+    # Load weekly and monthly reports
+    weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
+    monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
 
-        # Ensure column names
-        required_columns = ["Item", "Item Code", "Unit", "Quantity"]
-        if not all(col in weekly_df.columns for col in required_columns) or not all(col in monthly_df.columns for col in required_columns):
-            return {"error": "Missing required columns in uploaded files."}
+    # Group by Item Code and sum Quantity
+    weekly_grouped = weekly_data.groupby("Item Code").agg({
+        "Quantity": "sum",
+        "Item Name": "first",
+        "Unit": "first",
+        "Category Name": "first"
+    }).reset_index()
+    weekly_grouped["Daily Avg Weekly"] = weekly_grouped["Quantity"] / 7
 
-        # Group and sum
-        weekly_grouped = weekly_df.groupby(["Item", "Item Code", "Unit"])["Quantity"].sum().reset_index()
-        monthly_grouped = monthly_df.groupby(["Item", "Item Code", "Unit"])["Quantity"].sum().reset_index()
+    monthly_grouped = monthly_data.groupby("Item Code").agg({
+        "Quantity": "sum",
+        "Item Name": "first",
+        "Unit": "first",
+        "Category Name": "first"
+    }).reset_index()
+    monthly_grouped["Daily Avg Monthly"] = monthly_grouped["Quantity"] / 30
 
-        # Daily averages
-        weekly_grouped["Weekly_Avg"] = weekly_grouped["Quantity"] / 7
-        monthly_grouped["Monthly_Avg"] = monthly_grouped["Quantity"] / 30
+    # Merge both reports
+    combined = pd.merge(weekly_grouped, monthly_grouped, on="Item Code", how="outer", suffixes=("_weekly", "_monthly")).fillna(0)
 
-        # Merge
-        merged = pd.merge(weekly_grouped, monthly_grouped, on=["Item", "Item Code", "Unit"], how="outer")
-        merged.fillna(0, inplace=True)
+    # Calculate Suggested Par = max(daily avg weekly, daily avg monthly)
+    combined["Suggested Par"] = combined[["Daily Avg Weekly", "Daily Avg Monthly"]].max(axis=1)
 
-        # Suggested Par = max(weekly_avg, monthly_avg)
-        merged["Suggested Par"] = merged[["Weekly_Avg", "Monthly_Avg"]].max(axis=1).round(2)
+    # Prepare response
+    result = []
+    for _, row in combined.iterrows():
+        result.append({
+            "Item": row["Item Name_weekly"] or row["Item Name_monthly"],
+            "Item Code": row["Item Code"],
+            "Unit": row["Unit_weekly"] or row["Unit_monthly"],
+            "Suggested Par": round(row["Suggested Par"], 2),
+        })
 
-        # Final output
-        result = merged[["Item", "Item Code", "Unit", "Suggested Par"]].to_dict(orient="records")
-        return {"result": result}
-
-    except Exception as e:
-        return {"error": str(e)}
+    return {"result": result}
