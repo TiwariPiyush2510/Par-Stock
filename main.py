@@ -1,11 +1,14 @@
-# === main.py ===
-from fastapi import FastAPI, File, UploadFile
+# --- main.py ---
+
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
 from io import BytesIO
 
 app = FastAPI()
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,45 +18,55 @@ app.add_middleware(
 )
 
 @app.post("/calculate")
-async def calculate_par_stock(weekly_file: UploadFile = File(...), monthly_file: UploadFile = File(...)):
-    weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
-    monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
+async def calculate_par_stock(
+    weekly_file: UploadFile = File(...),
+    monthly_file: UploadFile = File(...)
+):
+    try:
+        # Read both Excel files
+        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
 
-    # Group and sum by Item Code for both
-    weekly_grouped = weekly_data.groupby("Item Code").agg({
-        "Item": "first",
-        "Unit": "first",
-        "Quantity": "sum"
-    }).reset_index()
-    monthly_grouped = monthly_data.groupby("Item Code").agg({
-        "Item": "first",
-        "Unit": "first",
-        "Quantity": "sum"
-    }).reset_index()
+        # Clean column names
+        for df in [weekly_df, monthly_df]:
+            df.columns = df.columns.str.strip()
 
-    result = []
-    all_codes = set(weekly_grouped["Item Code"]).union(set(monthly_grouped["Item Code"]))
+        # Group by Item Code and sum quantity
+        weekly_grouped = weekly_df.groupby("Item Code").agg({
+            "Quantity": "sum",
+            "Item Name": "first",
+            "Unit": "first",
+        }).reset_index()
+        weekly_grouped["Daily Avg"] = weekly_grouped["Quantity"] / 7
 
-    for code in all_codes:
-        weekly_row = weekly_grouped[weekly_grouped["Item Code"] == code]
-        monthly_row = monthly_grouped[monthly_grouped["Item Code"] == code]
+        monthly_grouped = monthly_df.groupby("Item Code").agg({
+            "Quantity": "sum",
+            "Item Name": "first",
+            "Unit": "first",
+        }).reset_index()
+        monthly_grouped["Daily Avg"] = monthly_grouped["Quantity"] / 30
 
-        item_name = weekly_row["Item"].values[0] if not weekly_row.empty else monthly_row["Item"].values[0]
-        unit = weekly_row["Unit"].values[0] if not weekly_row.empty else monthly_row["Unit"].values[0]
+        # Merge on Item Code
+        merged = pd.merge(weekly_grouped, monthly_grouped, on="Item Code", how="outer", suffixes=("_weekly", "_monthly"))
+        merged.fillna("", inplace=True)
 
-        weekly_qty = weekly_row["Quantity"].values[0] if not weekly_row.empty else 0
-        monthly_qty = monthly_row["Quantity"].values[0] if not monthly_row.empty else 0
+        # Calculate Suggested Par as max of daily averages
+        merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].apply(lambda row: max(float(row[0] or 0), float(row[1] or 0)), axis=1)
 
-        weekly_avg = weekly_qty / 7 if weekly_qty else 0
-        monthly_avg = monthly_qty / 30 if monthly_qty else 0
+        # Format results
+        result = []
+        for _, row in merged.iterrows():
+            result.append({
+                "Item Name": row["Item Name_weekly"] or row["Item Name_monthly"],
+                "Item Code": row["Item Code"],
+                "Unit": row["Unit_weekly"] or row["Unit_monthly"],
+                "Suggested Par": round(row["Suggested Par"], 2),
+                "Stock in Hand": 0,
+                "Expected Delivery": 0,
+                "Final Stock Needed": round(row["Suggested Par"], 2),
+            })
 
-        suggested_par = max(weekly_avg, monthly_avg)
+        return JSONResponse(content=result)
 
-        result.append({
-            "Item": item_name,
-            "Item Code": code,
-            "Unit": unit,
-            "Suggested Par": round(suggested_par, 2)
-        })
-
-    return {"result": result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
