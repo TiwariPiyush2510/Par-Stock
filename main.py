@@ -1,72 +1,59 @@
-# --- main.py ---
-
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import pandas as pd
 from io import BytesIO
 
 app = FastAPI()
 
-# CORS
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/calculate")
+@app.post("/calculate/")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...)
 ):
-    try:
-        # Read both Excel files
-        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
-        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
+    weekly_content = await weekly_file.read()
+    monthly_content = await monthly_file.read()
 
-        # Clean column names
-        for df in [weekly_df, monthly_df]:
-            df.columns = df.columns.str.strip()
+    df_weekly = pd.read_excel(BytesIO(weekly_content))
+    df_monthly = pd.read_excel(BytesIO(monthly_content))
 
-        # Group by Item Code and sum quantity
-        weekly_grouped = weekly_df.groupby("Item Code").agg({
-            "Quantity": "sum",
-            "Item Name": "first",
-            "Unit": "first",
-        }).reset_index()
-        weekly_grouped["Daily Avg"] = weekly_grouped["Quantity"] / 7
+    # Sum quantities per item for weekly and monthly
+    weekly_group = df_weekly.groupby("Item Code").agg({
+        "Quantity": "sum",
+        "Item Name": "first",
+        "Unit": "first"
+    }).reset_index()
+    weekly_group["Weekly Avg"] = weekly_group["Quantity"] / 7
 
-        monthly_grouped = monthly_df.groupby("Item Code").agg({
-            "Quantity": "sum",
-            "Item Name": "first",
-            "Unit": "first",
-        }).reset_index()
-        monthly_grouped["Daily Avg"] = monthly_grouped["Quantity"] / 30
+    monthly_group = df_monthly.groupby("Item Code").agg({
+        "Quantity": "sum",
+        "Item Name": "first",
+        "Unit": "first"
+    }).reset_index()
+    monthly_group["Monthly Avg"] = monthly_group["Quantity"] / 30
 
-        # Merge on Item Code
-        merged = pd.merge(weekly_grouped, monthly_grouped, on="Item Code", how="outer", suffixes=("_weekly", "_monthly"))
-        merged.fillna("", inplace=True)
+    # Merge both
+    merged = pd.merge(weekly_group, monthly_group, on="Item Code", how="outer", suffixes=('_week', '_month'))
 
-        # Calculate Suggested Par as max of daily averages
-        merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].apply(lambda row: max(float(row[0] or 0), float(row[1] or 0)), axis=1)
+    # Fill missing fields
+    for col in ["Item Name_week", "Item Name_month", "Unit_week", "Unit_month"]:
+        if col not in merged.columns:
+            merged[col] = ""
 
-        # Format results
-        result = []
-        for _, row in merged.iterrows():
-            result.append({
-                "Item Name": row["Item Name_weekly"] or row["Item Name_monthly"],
-                "Item Code": row["Item Code"],
-                "Unit": row["Unit_weekly"] or row["Unit_monthly"],
-                "Suggested Par": round(row["Suggested Par"], 2),
-                "Stock in Hand": 0,
-                "Expected Delivery": 0,
-                "Final Stock Needed": round(row["Suggested Par"], 2),
-            })
+    merged["Item Name"] = merged["Item Name_week"].combine_first(merged["Item Name_month"])
+    merged["Unit"] = merged["Unit_week"].combine_first(merged["Unit_month"])
 
-        return JSONResponse(content=result)
+    merged["Weekly Avg"] = merged["Weekly Avg"].fillna(0)
+    merged["Monthly Avg"] = merged["Monthly Avg"].fillna(0)
 
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    merged["Suggested Par"] = merged[["Weekly Avg", "Monthly Avg"]].max(axis=1)
+    merged = merged[["Item Name", "Item Code", "Unit", "Suggested Par"]]
+
+    return merged.to_dict(orient="records")
