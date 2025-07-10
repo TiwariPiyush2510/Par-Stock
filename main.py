@@ -1,43 +1,65 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 import pandas as pd
-from io import BytesIO
+from typing import List
 
 app = FastAPI()
 
+# Allow frontend access (update with your actual frontend domain if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 @app.post("/calculate")
-async def calculate_par_stock(weekly_file: UploadFile = File(...), monthly_file: UploadFile = File(...)):
-    weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
-    monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
+async def calculate_par_stock(
+    weekly_file: UploadFile = File(...),
+    monthly_file: UploadFile = File(...),
+):
+    try:
+        weekly_df = pd.read_excel(weekly_file.file)
+        monthly_df = pd.read_excel(monthly_file.file)
 
-    # Group and sum by Item and Item Code
-    weekly_summary = weekly_df.groupby(["Item", "Item Code", "Unit"], as_index=False)["Quantity"].sum()
-    weekly_summary["Weekly Avg"] = weekly_summary["Quantity"] / 7
+        # Normalize column names
+        weekly_df.columns = weekly_df.columns.str.strip()
+        monthly_df.columns = monthly_df.columns.str.strip()
 
-    monthly_summary = monthly_df.groupby(["Item", "Item Code", "Unit"], as_index=False)["Quantity"].sum()
-    monthly_summary["Monthly Avg"] = monthly_summary["Quantity"] / 30
+        # Merge both files on Item Code
+        merged_df = pd.merge(
+            weekly_df,
+            monthly_df,
+            on=["Item Code"],
+            suffixes=("_weekly", "_monthly"),
+            how="outer",
+        )
 
-    # Merge both summaries
-    merged = pd.merge(weekly_summary, monthly_summary, on=["Item", "Item Code", "Unit"], how="outer", suffixes=("_weekly", "_monthly")).fillna(0)
+        merged_df.fillna(0, inplace=True)
 
-    # Determine suggested par
-    merged["Suggested Par"] = merged[["Weekly Avg", "Monthly Avg"]].max(axis=1)
+        result = []
+        for _, row in merged_df.iterrows():
+            item = row.get("Item_weekly") or row.get("Item_monthly") or "Unknown"
+            item_code = row.get("Item Code")
+            unit = row.get("Unit_weekly") or row.get("Unit_monthly") or ""
 
-    result = []
-    for _, row in merged.iterrows():
-        result.append({
-            "Item": row["Item"],
-            "Item Code": row["Item Code"],
-            "Unit": row["Unit"],
-            "Suggested Par": round(row["Suggested Par"], 2),
-        })
+            weekly_total = row.get("Total Usage_weekly", 0)
+            monthly_total = row.get("Total Usage_monthly", 0)
 
-    return {"result": result}
+            weekly_avg = weekly_total / 7 if weekly_total else 0
+            monthly_avg = monthly_total / 30 if monthly_total else 0
+
+            suggested_par = round(max(weekly_avg, monthly_avg), 2)
+
+            result.append({
+                "Item": item,
+                "Item Code": item_code,
+                "Unit": unit,
+                "Suggested Par": suggested_par
+            })
+
+        return {"result": result}
+
+    except Exception as e:
+        return {"error": str(e)}
