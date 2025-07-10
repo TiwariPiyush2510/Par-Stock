@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File
+# === main.py ===
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from io import BytesIO
@@ -15,41 +16,44 @@ app.add_middleware(
 
 @app.post("/calculate")
 async def calculate_par_stock(weekly_file: UploadFile = File(...), monthly_file: UploadFile = File(...)):
-    # Load weekly and monthly reports
     weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
     monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
 
-    # Group by Item Code and sum Quantity
+    # Group and sum by Item Code for both
     weekly_grouped = weekly_data.groupby("Item Code").agg({
-        "Quantity": "sum",
-        "Item Name": "first",
+        "Item": "first",
         "Unit": "first",
-        "Category Name": "first"
+        "Quantity": "sum"
     }).reset_index()
-    weekly_grouped["Daily Avg Weekly"] = weekly_grouped["Quantity"] / 7
-
     monthly_grouped = monthly_data.groupby("Item Code").agg({
-        "Quantity": "sum",
-        "Item Name": "first",
+        "Item": "first",
         "Unit": "first",
-        "Category Name": "first"
+        "Quantity": "sum"
     }).reset_index()
-    monthly_grouped["Daily Avg Monthly"] = monthly_grouped["Quantity"] / 30
 
-    # Merge both reports
-    combined = pd.merge(weekly_grouped, monthly_grouped, on="Item Code", how="outer", suffixes=("_weekly", "_monthly")).fillna(0)
-
-    # Calculate Suggested Par = max(daily avg weekly, daily avg monthly)
-    combined["Suggested Par"] = combined[["Daily Avg Weekly", "Daily Avg Monthly"]].max(axis=1)
-
-    # Prepare response
     result = []
-    for _, row in combined.iterrows():
+    all_codes = set(weekly_grouped["Item Code"]).union(set(monthly_grouped["Item Code"]))
+
+    for code in all_codes:
+        weekly_row = weekly_grouped[weekly_grouped["Item Code"] == code]
+        monthly_row = monthly_grouped[monthly_grouped["Item Code"] == code]
+
+        item_name = weekly_row["Item"].values[0] if not weekly_row.empty else monthly_row["Item"].values[0]
+        unit = weekly_row["Unit"].values[0] if not weekly_row.empty else monthly_row["Unit"].values[0]
+
+        weekly_qty = weekly_row["Quantity"].values[0] if not weekly_row.empty else 0
+        monthly_qty = monthly_row["Quantity"].values[0] if not monthly_row.empty else 0
+
+        weekly_avg = weekly_qty / 7 if weekly_qty else 0
+        monthly_avg = monthly_qty / 30 if monthly_qty else 0
+
+        suggested_par = max(weekly_avg, monthly_avg)
+
         result.append({
-            "Item": row["Item Name_weekly"] or row["Item Name_monthly"],
-            "Item Code": row["Item Code"],
-            "Unit": row["Unit_weekly"] or row["Unit_monthly"],
-            "Suggested Par": round(row["Suggested Par"], 2),
+            "Item": item_name,
+            "Item Code": code,
+            "Unit": unit,
+            "Suggested Par": round(suggested_par, 2)
         })
 
     return {"result": result}
