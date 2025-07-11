@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
 from io import BytesIO
 
@@ -8,14 +9,9 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-def read_excel(file: UploadFile):
-    contents = file.file.read()
-    return pd.read_excel(BytesIO(contents))
 
 @app.post("/calculate_par_stock/")
 async def calculate_par_stock(
@@ -24,35 +20,62 @@ async def calculate_par_stock(
     barakat_file: UploadFile = File(None),
     ofi_file: UploadFile = File(None),
 ):
-    weekly_df = read_excel(weekly_file)
-    monthly_df = read_excel(monthly_file)
+    try:
+        # Load weekly & monthly files
+        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
 
-    merged = pd.merge(weekly_df, monthly_df, on="Item Name", suffixes=('_weekly', '_monthly'))
+        # Ensure correct columns
+        required_cols = ["Item Name", "Item Code", "Unit", "Total Quantity"]
+        for df in [weekly_df, monthly_df]:
+            if not all(col in df.columns for col in required_cols):
+                return JSONResponse(content={"error": "Missing required columns."}, status_code=400)
 
-    # Calculate daily averages
-    merged["Daily Avg Weekly"] = merged["Quantity_weekly"] / 7
-    merged["Daily Avg Monthly"] = merged["Quantity_monthly"] / 30
-    merged["Suggested Par"] = merged[["Daily Avg Weekly", "Daily Avg Monthly"]].max(axis=1).round(2)
+        # Average daily usage
+        weekly_df["Daily Avg"] = weekly_df["Total Quantity"] / 7
+        monthly_df["Daily Avg"] = monthly_df["Total Quantity"] / 30
 
-    # Add supplier info
-    merged["Supplier"] = ""
+        # Merge on Item Code
+        merged = pd.merge(
+            weekly_df[["Item Code", "Item Name", "Unit", "Daily Avg"]],
+            monthly_df[["Item Code", "Daily Avg"]],
+            on="Item Code",
+            suffixes=("_weekly", "_monthly"),
+            how="outer"
+        )
 
-    def mark_supplier(supplier_file, supplier_name):
-        if supplier_file:
-            supplier_df = read_excel(supplier_file)
-            supplier_items = supplier_df["Item Name"].str.strip().str.lower().tolist()
-            merged.loc[
-                merged["Item Name"].str.strip().str.lower().isin(supplier_items),
-                "Supplier"
-            ] = supplier_name
+        # Combine names and units
+        merged["Item Name"] = merged["Item Name_weekly"].combine_first(merged["Item Name_monthly"])
+        merged["Unit"] = merged["Unit_weekly"].combine_first(merged["Unit_monthly"])
 
-    mark_supplier(barakat_file, "Barakat")
-    mark_supplier(ofi_file, "OFI")
+        # Determine higher of the two daily averages
+        merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1)
+        merged = merged[["Item Name", "Item Code", "Unit", "Suggested Par"]].fillna(0)
 
-    # Clean up for frontend
-    result = merged[["Item Name", "Item Code_weekly", "Unit_weekly", "Suggested Par", "Supplier"]].copy()
-    result.columns = ["Item", "Item Code", "Unit", "Suggested Par", "Supplier"]
-    result["Stock in Hand"] = 0
-    result["Final Stock Needed"] = result["Suggested Par"]
+        # Load supplier templates
+        supplier_map = {}
 
-    return result.to_dict(orient="records")
+        if barakat_file:
+            barakat_df = pd.read_excel(BytesIO(await barakat_file.read()))
+            barakat_items = barakat_df.iloc[:, 0].astype(str).str.strip().str.lower().tolist()
+            for item in barakat_items:
+                supplier_map[item] = "Barakat"
+
+        if ofi_file:
+            ofi_df = pd.read_excel(BytesIO(await ofi_file.read()))
+            ofi_items = ofi_df.iloc[:, 0].astype(str).str.strip().str.lower().tolist()
+            for item in ofi_items:
+                supplier_map[item] = "OFI"
+
+        # Match supplier by item name
+        merged["Supplier"] = merged["Item Name"].str.strip().str.lower().map(supplier_map).fillna("")
+
+        # Round values and prepare final output
+        merged["Suggested Par"] = merged["Suggested Par"].round(2)
+        merged["Stock in Hand"] = 0
+        merged["Final Stock Needed"] = merged["Suggested Par"]  # Placeholder; adjusted on frontend
+
+        return merged.to_dict(orient="records")
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
