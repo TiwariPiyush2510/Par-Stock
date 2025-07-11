@@ -1,39 +1,119 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import io
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Par Stock Calculator</title>
+  <style>
+    body { font-family: Arial; margin: 20px; }
+    table, th, td { border: 1px solid black; border-collapse: collapse; padding: 5px; }
+    th { background-color: #f2f2f2; }
+    input[type="file"] { margin-bottom: 10px; }
+    button { margin: 5px; }
+  </style>
+</head>
+<body>
 
-app = FastAPI()
+<h2>Upload Weekly & Monthly Excel Files</h2>
 
-# Allow frontend calls
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+<input type="file" id="monthlyFile" /> Monthly consumption.xlsx<br/>
+<input type="file" id="weeklyFile" /> Weekly Consumption.xlsx<br/>
+<input type="file" id="supplierFile" /> Upload Supplier File<br/>
 
-def process_file(file: UploadFile, days: int):
-    contents = file.file.read()
-    df = pd.read_excel(io.BytesIO(contents))
-    df = df.rename(columns=lambda x: x.strip())
-    df = df[["Item", "Item Code", "Unit", "Quantity"]]
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-    df = df.groupby(["Item", "Item Code", "Unit"], as_index=False)["Quantity"].sum()
-    df["Daily Avg"] = df["Quantity"] / days
-    return df
+<br/>
+<button onclick="calculateParStock()">Calculate Par Stock</button>
 
-@app.post("/calculate")
-async def calculate_par_stock(weekly_file: UploadFile = File(...), monthly_file: UploadFile = File(...)):
-    weekly_df = process_file(weekly_file, 7)
-    monthly_df = process_file(monthly_file, 30)
+<h3>Search:</h3>
+<input type="text" id="searchInput" placeholder="Search for item..." onkeyup="searchTable()" />
+<div id="supplierButtons"></div>
+<button onclick="exportToCSV()">Export as CSV</button>
 
-    merged = pd.merge(weekly_df, monthly_df, on=["Item", "Item Code", "Unit"], how="outer", suffixes=('_weekly', '_monthly'))
-    merged = merged.fillna(0)
+<br/><br/>
+<table id="stockTable">
+  <thead>
+    <tr>
+      <th>Item</th>
+      <th>Item Code</th>
+      <th>Unit</th>
+      <th>Suggested Par</th>
+      <th>Stock in Hand</th>
+      <th>Final Stock Needed</th>
+      <th>Supplier</th>
+    </tr>
+  </thead>
+  <tbody>
+    <!-- Filled by JS -->
+  </tbody>
+</table>
 
-    merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1)
-    merged = merged[["Item", "Item Code", "Unit", "Suggested Par"]]
-    merged["Suggested Par"] = merged["Suggested Par"].round(2)
+<script>
+let supplierList = [];
 
-    return {"result": merged.to_dict(orient="records")}
+function searchTable() {
+  const input = document.getElementById("searchInput").value.toLowerCase();
+  const rows = document.querySelectorAll("#stockTable tbody tr");
+  rows.forEach(row => {
+    row.style.display = row.innerText.toLowerCase().includes(input) ? "" : "none";
+  });
+}
+
+function exportToCSV() {
+  // implement as per your CSV logic
+}
+
+function calculateParStock() {
+  alert("Pretend we calculated and populated the table. 😊 Now filter buttons work!");
+  populateSampleData(); // for demo
+}
+
+function populateSampleData() {
+  const data = [
+    { item: "Hummus", code: "RM-10001", unit: "KG", par: 50, stock: 20, supplier: "Barakat" },
+    { item: "Butter", code: "RM-10002", unit: "KG", par: 80, stock: 40, supplier: "OFI" },
+    { item: "Garlic Paste", code: "RM-10003", unit: "L", par: 20, stock: 30, supplier: "OFI" },
+  ];
+
+  const tbody = document.querySelector("#stockTable tbody");
+  tbody.innerHTML = "";
+  data.forEach(d => {
+    const final = Math.max(0, d.par - d.stock);
+    const row = `<tr data-supplier="${d.supplier}">
+      <td>${d.item}</td>
+      <td>${d.code}</td>
+      <td>${d.unit}</td>
+      <td>${d.par}</td>
+      <td>${d.stock}</td>
+      <td>${final}</td>
+      <td>${d.supplier}</td>
+    </tr>`;
+    tbody.innerHTML += row;
+  });
+
+  createSupplierButtons(["Barakat", "OFI"]);
+}
+
+function createSupplierButtons(suppliers) {
+  const container = document.getElementById("supplierButtons");
+  container.innerHTML = "";
+  suppliers.forEach(s => {
+    const btn = document.createElement("button");
+    btn.textContent = s;
+    btn.onclick = () => filterBySupplier(s);
+    container.appendChild(btn);
+  });
+
+  const showAllBtn = document.createElement("button");
+  showAllBtn.textContent = "Show All";
+  showAllBtn.onclick = () => filterBySupplier("all");
+  container.appendChild(showAllBtn);
+}
+
+function filterBySupplier(supplier) {
+  const rows = document.querySelectorAll("#stockTable tbody tr");
+  rows.forEach(row => {
+    const currentSupplier = row.getAttribute("data-supplier").toLowerCase();
+    row.style.display = (supplier === "all" || currentSupplier === supplier.toLowerCase()) ? "" : "none";
+  });
+}
+</script>
+
+</body>
+</html>
