@@ -1,76 +1,86 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from fastapi.responses import JSONResponse
 import pandas as pd
-import io
+from io import BytesIO
 
 app = FastAPI()
 
-origins = ["*"]  # Allow all origins
-
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-barakat_items = set()
-ofi_items = set()
+def calculate_par_stock(weekly_df, monthly_df, barakat_items, ofi_items):
+    combined_df = pd.concat([weekly_df, monthly_df], ignore_index=True)
 
-@app.post("/calculate")
-async def calculate_par_stock(
-    weekly_file: UploadFile = File(...),
+    grouped = combined_df.groupby(['Item Name', 'Item Code', 'Unit']).agg({
+        'Quantity': 'sum'
+    }).reset_index()
+
+    weekly_total = weekly_df.groupby(['Item Name'])['Quantity'].sum()
+    monthly_total = monthly_df.groupby(['Item Name'])['Quantity'].sum()
+
+    result = []
+    all_items = set(weekly_total.index).union(monthly_total.index)
+
+    for item in all_items:
+        weekly_avg = weekly_total.get(item, 0) / 7
+        monthly_avg = monthly_total.get(item, 0) / 30
+        suggested_par = round(max(weekly_avg, monthly_avg), 2)
+
+        item_row = grouped[grouped['Item Name'] == item].iloc[0]
+        supplier = ''
+        if item.strip().lower() in barakat_items:
+            supplier = 'Barakat'
+        elif item.strip().lower() in ofi_items:
+            supplier = 'OFI'
+
+        result.append({
+            'Item': item_row['Item Name'],
+            'Item Code': item_row['Item Code'],
+            'Unit': item_row['Unit'],
+            'Suggested Par': suggested_par,
+            'Stock in Hand': 0,
+            'Final Stock Needed': suggested_par,
+            'Supplier': supplier
+        })
+
+    return result
+
+@app.post("/calculate/")
+async def calculate(
     monthly_file: UploadFile = File(...),
-    supplier_files: List[UploadFile] = File(None)
+    weekly_file: UploadFile = File(...),
+    barakat_file: UploadFile = File(None),
+    ofi_file: UploadFile = File(None)
 ):
     try:
-        weekly_df = pd.read_excel(io.BytesIO(await weekly_file.read()))
-        monthly_df = pd.read_excel(io.BytesIO(await monthly_file.read()))
+        # Load consumption reports
+        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
+        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
 
-        def clean_df(df):
-            df.columns = df.columns.str.strip()
-            return df[['Item Name', 'Item Code', 'Unit', 'Quantity']].dropna()
+        # Normalize headers
+        for df in [monthly_df, weekly_df]:
+            df.columns = [col.strip() for col in df.columns]
 
-        weekly_df = clean_df(weekly_df)
-        monthly_df = clean_df(monthly_df)
+        # Load supplier item names
+        def extract_item_names(file):
+            if file is None:
+                return set()
+            df = pd.read_excel(BytesIO(file))
+            df.columns = [str(c).strip() for c in df.columns]
+            return set(df.iloc[:, 1].dropna().astype(str).str.strip().str.lower())
 
-        weekly_grouped = weekly_df.groupby(['Item Name', 'Item Code', 'Unit'])['Quantity'].sum().reset_index()
-        monthly_grouped = monthly_df.groupby(['Item Name', 'Item Code', 'Unit'])['Quantity'].sum().reset_index()
+        barakat_items = extract_item_names(await barakat_file.read()) if barakat_file else set()
+        ofi_items = extract_item_names(await ofi_file.read()) if ofi_file else set()
 
-        weekly_grouped['Daily'] = weekly_grouped['Quantity'] / 7
-        monthly_grouped['Daily'] = monthly_grouped['Quantity'] / 30
+        # Process logic
+        result = calculate_par_stock(weekly_df, monthly_df, barakat_items, ofi_items)
 
-        merged = pd.merge(weekly_grouped, monthly_grouped, on=['Item Name', 'Item Code', 'Unit'], how='outer', suffixes=('_weekly', '_monthly'))
-        merged.fillna(0, inplace=True)
-
-        merged['Suggested Par'] = merged[['Daily_weekly', 'Daily_monthly']].max(axis=1).round(2)
-
-        merged = merged[['Item Name', 'Item Code', 'Unit', 'Suggested Par']]
-        merged.rename(columns={'Item Name': 'Item'}, inplace=True)
-
-        # Process uploaded supplier templates
-        global barakat_items, ofi_items
-        if supplier_files:
-            for f in supplier_files:
-                name = f.filename.lower()
-                supplier_df = pd.read_excel(io.BytesIO(await f.read()), header=None)
-                supplier_df.columns = ['Item']
-                items = set(supplier_df['Item'].str.strip().str.lower())
-
-                if 'barakat' in name:
-                    barakat_items = items
-                elif 'ofi' in name:
-                    ofi_items = items
-
-        result = merged.to_dict(orient="records")
-        return {"result": result}
+        return JSONResponse(content=result)
     except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/suppliers")
-def get_suppliers():
-    return {
-        "barakat": list(barakat_items),
-        "ofi": list(ofi_items)
-    }
+        return JSONResponse(status_code=500, content={"error": str(e)})
