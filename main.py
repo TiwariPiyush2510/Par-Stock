@@ -1,72 +1,58 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import pandas as pd
-import io
+from io import BytesIO
 
 app = FastAPI()
 
-# CORS config
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/calculate")
+def read_excel(file: UploadFile):
+    contents = file.file.read()
+    return pd.read_excel(BytesIO(contents))
+
+@app.post("/calculate_par_stock/")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
     barakat_file: UploadFile = File(None),
-    ofi_file: UploadFile = File(None)
+    ofi_file: UploadFile = File(None),
 ):
-    try:
-        # Read weekly & monthly
-        weekly_df = pd.read_excel(io.BytesIO(await weekly_file.read()))
-        monthly_df = pd.read_excel(io.BytesIO(await monthly_file.read()))
+    weekly_df = read_excel(weekly_file)
+    monthly_df = read_excel(monthly_file)
 
-        # Normalize headers
-        weekly_df.columns = weekly_df.columns.str.strip()
-        monthly_df.columns = monthly_df.columns.str.strip()
+    merged = pd.merge(weekly_df, monthly_df, on="Item Name", suffixes=('_weekly', '_monthly'))
 
-        # Daily Avg
-        weekly_df["Daily Avg"] = weekly_df["Quantity"] / 7
-        monthly_df["Daily Avg"] = monthly_df["Quantity"] / 30
+    # Calculate daily averages
+    merged["Daily Avg Weekly"] = merged["Quantity_weekly"] / 7
+    merged["Daily Avg Monthly"] = merged["Quantity_monthly"] / 30
+    merged["Suggested Par"] = merged[["Daily Avg Weekly", "Daily Avg Monthly"]].max(axis=1).round(2)
 
-        # Merge both
-        merged = pd.merge(
-            weekly_df,
-            monthly_df,
-            on="Item Name",
-            suffixes=("_weekly", "_monthly")
-        )
+    # Add supplier info
+    merged["Supplier"] = ""
 
-        merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1)
+    def mark_supplier(supplier_file, supplier_name):
+        if supplier_file:
+            supplier_df = read_excel(supplier_file)
+            supplier_items = supplier_df["Item Name"].str.strip().str.lower().tolist()
+            merged.loc[
+                merged["Item Name"].str.strip().str.lower().isin(supplier_items),
+                "Supplier"
+            ] = supplier_name
 
-        # Build result
-        result = merged[["Item Name", "Item Code_weekly", "Unit_weekly", "Suggested Par"]].copy()
-        result.columns = ["Item", "Item Code", "Unit", "Suggested Par"]
-        result["Stock in Hand"] = 0
-        result["Final Stock Needed"] = result["Suggested Par"]  # default before edits
-        result["Supplier"] = ""
+    mark_supplier(barakat_file, "Barakat")
+    mark_supplier(ofi_file, "OFI")
 
-        # Helper to tag supplier
-        def tag_supplier(file: UploadFile, name: str):
-            if file:
-                df = pd.read_excel(io.BytesIO(file.file.read()))
-                df.columns = df.columns.str.strip()
-                item_list = df["Item Name"].astype(str).str.strip().str.lower().tolist()
-                result.loc[result["Item"].astype(str).str.strip().str.lower().isin(item_list), "Supplier"] = name
+    # Clean up for frontend
+    result = merged[["Item Name", "Item Code_weekly", "Unit_weekly", "Suggested Par", "Supplier"]].copy()
+    result.columns = ["Item", "Item Code", "Unit", "Suggested Par", "Supplier"]
+    result["Stock in Hand"] = 0
+    result["Final Stock Needed"] = result["Suggested Par"]
 
-        tag_supplier(barakat_file, "Barakat")
-        tag_supplier(ofi_file, "OFI")
-
-        # Round for display
-        result["Suggested Par"] = result["Suggested Par"].round(2)
-        result["Final Stock Needed"] = result["Final Stock Needed"].round(2)
-
-        return JSONResponse(content=result.to_dict(orient="records"))
-
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return result.to_dict(orient="records")
