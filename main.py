@@ -1,73 +1,76 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
 from typing import List
-from io import BytesIO
+import pandas as pd
+import io
 
 app = FastAPI()
 
+origins = ["*"]  # Allow all origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+barakat_items = set()
+ofi_items = set()
 
-def clean_string(s):
-    return str(s).strip().lower()
-
-
-@app.post("/calculate/")
+@app.post("/calculate")
 async def calculate_par_stock(
-    monthly_file: UploadFile = File(...),
     weekly_file: UploadFile = File(...),
-    barakat_file: UploadFile = File(None),
+    monthly_file: UploadFile = File(...),
+    supplier_files: List[UploadFile] = File(None)
 ):
-    # Read Excel files
-    monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
-    weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
+    try:
+        weekly_df = pd.read_excel(io.BytesIO(await weekly_file.read()))
+        monthly_df = pd.read_excel(io.BytesIO(await monthly_file.read()))
 
-    # Ensure correct columns exist
-    if "Item Code" not in monthly_data.columns or "Quantity" not in monthly_data.columns:
-        return {"error": "Invalid Monthly File format"}
+        def clean_df(df):
+            df.columns = df.columns.str.strip()
+            return df[['Item Name', 'Item Code', 'Unit', 'Quantity']].dropna()
 
-    if "Item Code" not in weekly_data.columns or "Quantity" not in weekly_data.columns:
-        return {"error": "Invalid Weekly File format"}
+        weekly_df = clean_df(weekly_df)
+        monthly_df = clean_df(monthly_df)
 
-    # Combine and compute average per day
-    monthly_grouped = monthly_data.groupby("Item Code").agg({"Quantity": "sum"}).reset_index()
-    weekly_grouped = weekly_data.groupby("Item Code").agg({"Quantity": "sum"}).reset_index()
+        weekly_grouped = weekly_df.groupby(['Item Name', 'Item Code', 'Unit'])['Quantity'].sum().reset_index()
+        monthly_grouped = monthly_df.groupby(['Item Name', 'Item Code', 'Unit'])['Quantity'].sum().reset_index()
 
-    monthly_grouped["Monthly Avg"] = monthly_grouped["Quantity"] / 30
-    weekly_grouped["Weekly Avg"] = weekly_grouped["Quantity"] / 7
+        weekly_grouped['Daily'] = weekly_grouped['Quantity'] / 7
+        monthly_grouped['Daily'] = monthly_grouped['Quantity'] / 30
 
-    merged = pd.merge(monthly_grouped[["Item Code", "Monthly Avg"]],
-                      weekly_grouped[["Item Code", "Weekly Avg"]],
-                      on="Item Code", how="outer")
+        merged = pd.merge(weekly_grouped, monthly_grouped, on=['Item Name', 'Item Code', 'Unit'], how='outer', suffixes=('_weekly', '_monthly'))
+        merged.fillna(0, inplace=True)
 
-    merged.fillna(0, inplace=True)
-    merged["Suggested Par"] = merged[["Monthly Avg", "Weekly Avg"]].max(axis=1)
+        merged['Suggested Par'] = merged[['Daily_weekly', 'Daily_monthly']].max(axis=1).round(2)
 
-    # Add Item Name, Unit etc. from monthly file
-    item_info = monthly_data.drop_duplicates(subset="Item Code")[["Item Code", "Item Name", "Unit"]]
-    merged = pd.merge(merged, item_info, on="Item Code", how="left")
+        merged = merged[['Item Name', 'Item Code', 'Unit', 'Suggested Par']]
+        merged.rename(columns={'Item Name': 'Item'}, inplace=True)
 
-    merged["Stock in Hand"] = 0
-    merged["Final Stock Needed"] = merged["Suggested Par"]
+        # Process uploaded supplier templates
+        global barakat_items, ofi_items
+        if supplier_files:
+            for f in supplier_files:
+                name = f.filename.lower()
+                supplier_df = pd.read_excel(io.BytesIO(await f.read()), header=None)
+                supplier_df.columns = ['Item']
+                items = set(supplier_df['Item'].str.strip().str.lower())
 
-    # Handle supplier tagging using Item Name from Barakat file
-    barakat_items = []
-    if barakat_file is not None:
-        barakat_df = pd.read_excel(BytesIO(await barakat_file.read()))
-        barakat_items = barakat_df.iloc[:, 1].dropna().apply(clean_string).tolist()
+                if 'barakat' in name:
+                    barakat_items = items
+                elif 'ofi' in name:
+                    ofi_items = items
 
-    merged["Supplier"] = merged["Item Name"].apply(lambda x: "Barakat" if clean_string(x) in barakat_items else "")
+        result = merged.to_dict(orient="records")
+        return {"result": result}
+    except Exception as e:
+        return {"error": str(e)}
 
-    # Reorder and rename columns
-    merged = merged[["Item Name", "Item Code", "Unit", "Suggested Par", "Stock in Hand", "Final Stock Needed", "Supplier"]]
-    merged.rename(columns={"Item Name": "Item"}, inplace=True)
-
-    result = merged.to_dict(orient="records")
-    return {"data": result}
+@app.get("/suppliers")
+def get_suppliers():
+    return {
+        "barakat": list(barakat_items),
+        "ofi": list(ofi_items)
+    }
