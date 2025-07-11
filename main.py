@@ -1,12 +1,12 @@
-# main.py
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
-from io import BytesIO
+import io
 
 app = FastAPI()
 
+# Allow CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,80 +17,69 @@ app.add_middleware(
 
 @app.post("/calculate_par_stock/")
 async def calculate_par_stock(
-    request: Request,
-    monthly: UploadFile = File(...),
-    weekly: UploadFile = File(...),
-    barakat: UploadFile = File(None),
-    ofi: UploadFile = File(None),
+    monthly_file: UploadFile = File(...),
+    weekly_file: UploadFile = File(...),
+    barakat_file: UploadFile = File(None),
+    ofi_file: UploadFile = File(None)
 ):
     try:
-        # Load consumption reports
-        monthly_df = pd.read_excel(BytesIO(await monthly.read()))
-        weekly_df = pd.read_excel(BytesIO(await weekly.read()))
+        # Read uploaded files
+        monthly_df = pd.read_excel(monthly_file.file)
+        weekly_df = pd.read_excel(weekly_file.file)
 
-        # Compute average daily usage
-        monthly_df['Daily Avg'] = monthly_df['Quantity'] / 30
-        weekly_df['Daily Avg'] = weekly_df['Quantity'] / 7
+        # Clean column names
+        monthly_df.columns = monthly_df.columns.str.strip()
+        weekly_df.columns = weekly_df.columns.str.strip()
 
-        # Merge & get max daily avg per item
-        combined_df = pd.concat([monthly_df, weekly_df])
-        daily_avg_df = combined_df.groupby(['Item Name', 'Item Code', 'Unit']).agg({'Daily Avg': 'max'}).reset_index()
-        daily_avg_df = daily_avg_df.rename(columns={"Daily Avg": "Suggested Par"})
+        # Merge and compute average daily usage
+        merged = pd.merge(monthly_df, weekly_df, on="Item Name", how="outer", suffixes=('_monthly', '_weekly')).fillna(0)
+        merged["Monthly Avg"] = merged["Total Consumption_monthly"] / merged["Days_monthly"]
+        merged["Weekly Avg"] = merged["Total Consumption_weekly"] / merged["Days_weekly"]
+        merged["Suggested Par"] = merged[["Monthly Avg", "Weekly Avg"]].max(axis=1).round(2)
 
-        # Load current stock from frontend-uploaded template
-        stock_data = await request.form()
-        current_stock = {}
-        for key in stock_data:
-            if key.startswith("stock_"):
-                item = key.replace("stock_", "")
-                try:
-                    current_stock[item] = float(stock_data[key])
-                except:
-                    current_stock[item] = 0.0
+        # Read supplier files
+        barakat_items = []
+        ofi_items = []
 
-        # Supplier detection (Barakat, OFI)
-        supplier_map = {}
-        if barakat:
-            barakat_df = pd.read_excel(BytesIO(await barakat.read()))
-            for item in barakat_df['Item Name']:
-                supplier_map[item.strip().lower()] = 'Barakat'
-        if ofi:
-            ofi_df = pd.read_excel(BytesIO(await ofi.read()))
-            for item in ofi_df['Item Name']:
-                supplier_map[item.strip().lower()] = 'OFI'
+        if barakat_file:
+            barakat_df = pd.read_excel(barakat_file.file)
+            barakat_items = barakat_df["Item Name"].str.strip().str.lower().tolist()
 
-        # Final calculation
-        result = []
-        for _, row in daily_avg_df.iterrows():
-            item_name = row['Item Name']
-            item_code = row['Item Code']
-            unit = row['Unit']
-            suggested_par = round(row['Suggested Par'], 2)
-            stock_in_hand = round(current_stock.get(item_name, 0.0), 2)
-            
-            # Final stock logic
-            carry_forward = stock_in_hand - suggested_par
-            if carry_forward >= 0:
-                final_needed = max(0, suggested_par - carry_forward)
+        if ofi_file:
+            ofi_df = pd.read_excel(ofi_file.file)
+            ofi_items = ofi_df["Item Name"].str.strip().str.lower().tolist()
+
+        # Assign suppliers
+        def get_supplier(item_name):
+            name = item_name.strip().lower()
+            if name in barakat_items:
+                return "Barakat"
+            elif name in ofi_items:
+                return "OFI"
             else:
-                final_needed = suggested_par + abs(carry_forward)
+                return ""
 
-            final_needed = round(final_needed, 2)
+        merged["Supplier"] = merged["Item Name"].apply(get_supplier)
 
-            supplier = supplier_map.get(item_name.strip().lower(), "")
+        # Build response
+        final_data = []
+        for _, row in merged.iterrows():
+            item = row["Item Name"]
+            code = row.get("Item Code", "")
+            unit = row.get("Unit", "")
+            par = row["Suggested Par"]
 
-            result.append({
-                "Item": item_name,
-                "Item Code": item_code,
+            final_data.append({
+                "Item": item,
+                "Item Code": code,
                 "Unit": unit,
-                "Suggested Par": suggested_par,
-                "Stock in Hand": stock_in_hand,
-                "Final Stock Needed": final_needed,
-                "Supplier": supplier,
+                "Suggested Par": round(par, 2),
+                "Stock in Hand": 0,
+                "Final Stock Needed": round(par, 2),  # Initially same as par
+                "Supplier": row["Supplier"]
             })
 
-        return JSONResponse(content=result)
+        return JSONResponse(content=final_data)
 
     except Exception as e:
-        print("❌ Backend Error:", str(e))
         return JSONResponse(content={"error": str(e)}, status_code=500)
