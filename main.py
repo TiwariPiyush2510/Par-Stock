@@ -1,119 +1,79 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Par Stock Calculator</title>
-  <style>
-    body { font-family: Arial; margin: 20px; }
-    table, th, td { border: 1px solid black; border-collapse: collapse; padding: 5px; }
-    th { background-color: #f2f2f2; }
-    input[type="file"] { margin-bottom: 10px; }
-    button { margin: 5px; }
-  </style>
-</head>
-<body>
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import pandas as pd
+from typing import List
+import io
 
-<h2>Upload Weekly & Monthly Excel Files</h2>
+app = FastAPI()
 
-<input type="file" id="monthlyFile" /> Monthly consumption.xlsx<br/>
-<input type="file" id="weeklyFile" /> Weekly Consumption.xlsx<br/>
-<input type="file" id="supplierFile" /> Upload Supplier File<br/>
+# Enable CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # You can restrict this to your Netlify domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-<br/>
-<button onclick="calculateParStock()">Calculate Par Stock</button>
+@app.post("/calculate")
+async def calculate_par_stock(
+    weekly_file: UploadFile = File(...),
+    monthly_file: UploadFile = File(...),
+    barakat_file: UploadFile = File(None),
+    ofi_file: UploadFile = File(None)
+):
+    try:
+        # Read consumption files
+        weekly_df = pd.read_excel(io.BytesIO(await weekly_file.read()))
+        monthly_df = pd.read_excel(io.BytesIO(await monthly_file.read()))
 
-<h3>Search:</h3>
-<input type="text" id="searchInput" placeholder="Search for item..." onkeyup="searchTable()" />
-<div id="supplierButtons"></div>
-<button onclick="exportToCSV()">Export as CSV</button>
+        # Clean column names
+        weekly_df.columns = weekly_df.columns.str.strip()
+        monthly_df.columns = monthly_df.columns.str.strip()
 
-<br/><br/>
-<table id="stockTable">
-  <thead>
-    <tr>
-      <th>Item</th>
-      <th>Item Code</th>
-      <th>Unit</th>
-      <th>Suggested Par</th>
-      <th>Stock in Hand</th>
-      <th>Final Stock Needed</th>
-      <th>Supplier</th>
-    </tr>
-  </thead>
-  <tbody>
-    <!-- Filled by JS -->
-  </tbody>
-</table>
+        # Calculate daily averages
+        weekly_avg = weekly_df.copy()
+        weekly_avg["Daily Avg"] = weekly_avg["Quantity"] / 7
+        monthly_avg = monthly_df.copy()
+        monthly_avg["Daily Avg"] = monthly_avg["Quantity"] / 30
 
-<script>
-let supplierList = [];
+        # Merge and choose the higher average
+        merged = pd.merge(
+            weekly_avg,
+            monthly_avg,
+            on="Item Name",
+            suffixes=("_weekly", "_monthly")
+        )
 
-function searchTable() {
-  const input = document.getElementById("searchInput").value.toLowerCase();
-  const rows = document.querySelectorAll("#stockTable tbody tr");
-  rows.forEach(row => {
-    row.style.display = row.innerText.toLowerCase().includes(input) ? "" : "none";
-  });
-}
+        merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1)
 
-function exportToCSV() {
-  // implement as per your CSV logic
-}
+        # Keep necessary columns
+        output_df = merged[["Item Name", "Item Code_weekly", "Unit_weekly", "Suggested Par"]].copy()
+        output_df.columns = ["Item", "Item Code", "Unit", "Suggested Par"]
+        output_df["Stock in Hand"] = 0
+        output_df["Final Stock Needed"] = output_df["Suggested Par"]
 
-function calculateParStock() {
-  alert("Pretend we calculated and populated the table. 😊 Now filter buttons work!");
-  populateSampleData(); // for demo
-}
+        # Handle supplier tags
+        output_df["Supplier"] = ""
 
-function populateSampleData() {
-  const data = [
-    { item: "Hummus", code: "RM-10001", unit: "KG", par: 50, stock: 20, supplier: "Barakat" },
-    { item: "Butter", code: "RM-10002", unit: "KG", par: 80, stock: 40, supplier: "OFI" },
-    { item: "Garlic Paste", code: "RM-10003", unit: "L", par: 20, stock: 30, supplier: "OFI" },
-  ];
+        def mark_supplier(supplier_df, supplier_name):
+            if supplier_df is not None:
+                df = pd.read_excel(io.BytesIO(supplier_df))
+                df.columns = df.columns.str.strip()
+                items = df["Item Name"].str.strip().str.lower().tolist()
+                output_df.loc[
+                    output_df["Item"].str.strip().str.lower().isin(items), "Supplier"
+                ] = supplier_name
 
-  const tbody = document.querySelector("#stockTable tbody");
-  tbody.innerHTML = "";
-  data.forEach(d => {
-    const final = Math.max(0, d.par - d.stock);
-    const row = `<tr data-supplier="${d.supplier}">
-      <td>${d.item}</td>
-      <td>${d.code}</td>
-      <td>${d.unit}</td>
-      <td>${d.par}</td>
-      <td>${d.stock}</td>
-      <td>${final}</td>
-      <td>${d.supplier}</td>
-    </tr>`;
-    tbody.innerHTML += row;
-  });
+        mark_supplier(barakat_file, "Barakat")
+        mark_supplier(ofi_file, "OFI")
 
-  createSupplierButtons(["Barakat", "OFI"]);
-}
+        # Round values
+        output_df["Suggested Par"] = output_df["Suggested Par"].round(2)
+        output_df["Final Stock Needed"] = output_df["Final Stock Needed"].round(2)
 
-function createSupplierButtons(suppliers) {
-  const container = document.getElementById("supplierButtons");
-  container.innerHTML = "";
-  suppliers.forEach(s => {
-    const btn = document.createElement("button");
-    btn.textContent = s;
-    btn.onclick = () => filterBySupplier(s);
-    container.appendChild(btn);
-  });
+        return JSONResponse(content=output_df.to_dict(orient="records"))
 
-  const showAllBtn = document.createElement("button");
-  showAllBtn.textContent = "Show All";
-  showAllBtn.onclick = () => filterBySupplier("all");
-  container.appendChild(showAllBtn);
-}
-
-function filterBySupplier(supplier) {
-  const rows = document.querySelectorAll("#stockTable tbody tr");
-  rows.forEach(row => {
-    const currentSupplier = row.getAttribute("data-supplier").toLowerCase();
-    row.style.display = (supplier === "all" || currentSupplier === supplier.toLowerCase()) ? "" : "none";
-  });
-}
-</script>
-
-</body>
-</html>
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
