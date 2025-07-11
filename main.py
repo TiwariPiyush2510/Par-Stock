@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List
 import pandas as pd
 from io import BytesIO
 
@@ -13,63 +14,86 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def calculate_final_stock(suggested_par, stock_in_hand):
-    surplus = stock_in_hand - suggested_par
-    if surplus >= suggested_par:
-        return 0
-    else:
-        return round(suggested_par + max(0, suggested_par - stock_in_hand), 2)
-
 @app.post("/calculate/")
-async def calculate_par(
+async def calculate_par_stock(
     monthly_file: UploadFile = File(...),
     weekly_file: UploadFile = File(...),
     barakat_file: UploadFile = File(None),
     ofi_file: UploadFile = File(None)
 ):
-    # Read consumption data
-    monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
-    weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+    # Read monthly and weekly files
+    monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
+    weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
 
-    combined_df = pd.merge(weekly_df, monthly_df, on="Item Name", how="outer", suffixes=("_weekly", "_monthly"))
-    combined_df.fillna(0, inplace=True)
+    # Ensure necessary columns exist
+    required_columns = ["Item Name", "Quantity"]
+    if not all(col in monthly_data.columns for col in required_columns) or \
+       not all(col in weekly_data.columns for col in required_columns):
+        return {"error": "Missing required columns in one of the files."}
 
-    results = []
-    for _, row in combined_df.iterrows():
-        item = row["Item Name"]
-        item_code = row.get("Item Code_weekly") or row.get("Item Code_monthly")
-        unit = row.get("Unit_weekly") or row.get("Unit_monthly")
+    # Clean and prepare both datasets
+    def prepare_data(df):
+        df = df.copy()
+        df["Item Name"] = df["Item Name"].astype(str).str.strip().str.upper()
+        df = df.groupby("Item Name").agg({"Quantity": "sum"}).reset_index()
+        return df
 
-        weekly_total = row.get("Quantity_weekly", 0)
-        monthly_total = row.get("Quantity_monthly", 0)
+    monthly_grouped = prepare_data(monthly_data)
+    weekly_grouped = prepare_data(weekly_data)
 
-        weekly_avg = weekly_total / 7
-        monthly_avg = monthly_total / 30
-        suggested_par = round(max(weekly_avg, monthly_avg), 2)
+    # Merge the two datasets
+    merged = pd.merge(weekly_grouped, monthly_grouped, on="Item Name", how="outer", suffixes=('_weekly', '_monthly'))
+    merged.fillna(0, inplace=True)
 
-        results.append({
-            "Item": item,
-            "Item Code": item_code,
-            "Unit": unit,
-            "Suggested Par": suggested_par,
-            "Stock in Hand": 0,
-            "Final Stock Needed": suggested_par  # initial assumption before frontend update
-        })
+    # Calculate daily averages
+    merged["Weekly Avg"] = merged["Quantity_weekly"] / 7
+    merged["Monthly Avg"] = merged["Quantity_monthly"] / 30
+    merged["Suggested Par"] = merged[["Weekly Avg", "Monthly Avg"]].max(axis=1).round(2)
 
-    df = pd.DataFrame(results)
+    # Add extra columns
+    merged["Stock in Hand"] = 0.0
+    merged["Final Stock Needed"] = merged["Suggested Par"] * 2  # Initial placeholder
 
-    # Match Barakat items
+    # Try to match item details from original files
+    item_details_cols = ["Item Name", "Item Code", "Unit"]
+    item_details = None
+    for df in [weekly_data, monthly_data]:
+        if all(col in df.columns for col in item_details_cols):
+            temp = df[item_details_cols].drop_duplicates().copy()
+            temp["Item Name"] = temp["Item Name"].str.strip().str.upper()
+            item_details = temp
+            break
+
+    if item_details is not None:
+        merged = pd.merge(merged, item_details, on="Item Name", how="left")
+    else:
+        merged["Item Code"] = ""
+        merged["Unit"] = ""
+
+    # Supplier matching
+    merged["Supplier"] = ""
+
     if barakat_file:
-        barakat_df = pd.read_excel(BytesIO(await barakat_file.read()), header=None)
-        barakat_names = barakat_df.iloc[:, 1].str.strip().str.lower().tolist()
-        df["Supplier"] = df["Item"].str.strip().str.lower().apply(lambda x: "Barakat" if x in barakat_names else "")
+        barakat_df = pd.read_excel(BytesIO(await barakat_file.read()))
+        barakat_names = set(barakat_df.iloc[:, 1].astype(str).str.strip().str.upper())
+        merged.loc[merged["Item Name"].isin(barakat_names), "Supplier"] = "Barakat"
 
-    # Match OFI items
     if ofi_file:
-        ofi_df = pd.read_excel(BytesIO(await ofi_file.read()), header=None)
-        ofi_names = ofi_df.iloc[:, 1].str.strip().str.lower().tolist()
-        df["Supplier"] = df.apply(
-            lambda row: "OFI" if row["Item"].strip().lower() in ofi_names else row["Supplier"], axis=1
-        )
+        ofi_df = pd.read_excel(BytesIO(await ofi_file.read()))
+        ofi_names = set(ofi_df.iloc[:, 1].astype(str).str.strip().str.upper())
+        merged.loc[merged["Item Name"].isin(ofi_names), "Supplier"] = "OFI"
 
-    return df.to_dict(orient="records")
+    # Recalculate Final Stock Needed using corrected formula
+    merged["Final Stock Needed"] = (
+        merged["Suggested Par"] * 2 - merged["Stock in Hand"]
+    ).apply(lambda x: round(x if x > 0 else 0, 2))
+
+    # Prepare final result
+    result = merged[[
+        "Item Name", "Item Code", "Unit", "Suggested Par",
+        "Stock in Hand", "Final Stock Needed", "Supplier"
+    ]].rename(columns={
+        "Item Name": "Item",
+    })
+
+    return result.to_dict(orient="records")
