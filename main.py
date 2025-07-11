@@ -5,38 +5,47 @@ from io import BytesIO
 
 app = FastAPI()
 
-# CORS to allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/calculate-par-stock")
-async def calculate_par_stock(weekly_file: UploadFile = File(...), monthly_file: UploadFile = File(...)):
-    try:
-        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
-        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
-    except Exception as e:
-        return {"error": f"Failed to read Excel files: {str(e)}"}
+def get_daily_average(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    df["Daily Average"] = df["Total Quantity"] / days
+    return df
 
-    combined_items = pd.concat([weekly_df[['Item Code', 'Item Name', 'Unit', 'Quantity']],
-                                monthly_df[['Item Code', 'Item Name', 'Unit', 'Quantity']]])
-    
-    # Group by Item Code and get totals
-    weekly_total = weekly_df.groupby('Item Code')['Quantity'].sum() / 7
-    monthly_total = monthly_df.groupby('Item Code')['Quantity'].sum() / 30
-    suggested_par = pd.concat([weekly_total, monthly_total], axis=1).max(axis=1)
+def calculate_par_stock(weekly: pd.DataFrame, monthly: pd.DataFrame) -> pd.DataFrame:
+    weekly_avg = get_daily_average(weekly.copy(), 7)
+    monthly_avg = get_daily_average(monthly.copy(), 30)
 
-    item_info = combined_items.drop_duplicates('Item Code').set_index('Item Code')[['Item Name', 'Unit']]
+    merged = pd.merge(weekly_avg, monthly_avg, on="Item Code", suffixes=("_weekly", "_monthly"))
+    merged["Suggested Par"] = merged[["Daily Average_weekly", "Daily Average_monthly"]].max(axis=1)
 
-    # Combine everything
-    result = pd.DataFrame({
-        'Suggested Par': suggested_par,
-        'Item Name': item_info['Item Name'],
-        'Unit': item_info['Unit']
-    }).reset_index()
+    merged["Item"] = merged["Item_weekly"]
+    merged["Unit"] = merged["Unit_weekly"]
+    merged["Final Stock Needed"] = merged["Suggested Par"]  # Placeholder
 
-    return result.to_dict(orient="records")
+    return merged[["Item", "Item Code", "Unit", "Suggested Par", "Final Stock Needed"]]
+
+@app.post("/calculate")
+async def calculate_par(
+    weekly_file: UploadFile = File(...),
+    monthly_file: UploadFile = File(...),
+    barakat_file: UploadFile = File(None)
+):
+    weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
+    monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
+
+    result_df = calculate_par_stock(weekly_data, monthly_data)
+
+    if barakat_file:
+        barakat_df = pd.read_excel(BytesIO(await barakat_file.read()))
+        barakat_item_codes = set(barakat_df["Item Code"].astype(str))
+        result_df["Supplier"] = result_df["Item Code"].astype(str).apply(lambda code: "Barakat" if code in barakat_item_codes else "Other")
+    else:
+        result_df["Supplier"] = "Other"
+
+    result = result_df.to_dict(orient="records")
+    return {"result": result}
