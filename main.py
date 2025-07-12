@@ -1,12 +1,11 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 import pandas as pd
 import uvicorn
 
 app = FastAPI()
 
-# Set correct CORS (no trailing slash)
+# CORS: Ensure no trailing slash in Netlify URL
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://preeminent-choux-a8ea17.netlify.app"],
@@ -30,22 +29,20 @@ async def calculate_par_stock(
     barakat_file: UploadFile = File(...),
     ofi_file: UploadFile = File(...)
 ):
-    # Load files
     weekly_df = load_excel(weekly_file)
     monthly_df = load_excel(monthly_file)
     barakat_df = load_excel(barakat_file)
     ofi_df = load_excel(ofi_file)
 
-    for df in [weekly_df, monthly_df, barakat_df, ofi_df]:
+    for df in [weekly_df, monthly_df]:
         df.columns = df.columns.str.strip().str.lower()
 
-    # Clean barakat/ofi names
     for df in [barakat_df, ofi_df]:
+        df.columns = df.columns.str.strip().str.lower()
         if "item name" not in df.columns:
-            return {"error": "Missing 'Item Name' column in supplier file"}
+            return {"error": "Item Name column missing in supplier template"}
         df["item name"] = df["item name"].astype(str).str.strip().str.lower()
 
-    # Prepare weekly/monthly
     def clean(df):
         df = df.rename(columns={"quantity": "consumption"})
         df = df[["item name", "item code", "unit", "consumption"]]
@@ -56,21 +53,20 @@ async def calculate_par_stock(
     weekly_df = clean(weekly_df)
     monthly_df = clean(monthly_df)
 
-    weekly_df["daily"] = weekly_df["consumption"] / 7
-    monthly_df["daily"] = monthly_df["consumption"] / 30
+    weekly_df["daily_weekly"] = weekly_df["consumption"] / 7
+    monthly_df["daily_monthly"] = monthly_df["consumption"] / 30
 
     combined = pd.merge(weekly_df, monthly_df, on="item name", how="outer", suffixes=("_weekly", "_monthly"))
-    combined.fillna(0, inplace=True)
-    combined["suggested par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
+    combined = combined.fillna(0)
 
-    # Add fallback Item Code / Unit
-    combined["item code"] = combined["item code_weekly"]
-    combined["unit"] = combined["unit_weekly"]
-    combined["item code"].fillna(combined["item code_monthly"], inplace=True)
-    combined["unit"].fillna(combined["unit_monthly"], inplace=True)
+    combined["Suggested Par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
+    combined["Item Code"] = combined["item code_weekly"]
+    combined["Unit"] = combined["unit_weekly"]
+    combined["Item Code"].fillna(combined["item code_monthly"], inplace=True)
+    combined["Unit"].fillna(combined["unit_monthly"], inplace=True)
 
-    # Supplier tag
-    def tag_supplier(name):
+    def match_supplier(name):
+        name = str(name).strip().lower()
         if name in barakat_df["item name"].values:
             return "Barakat"
         elif name in ofi_df["item name"].values:
@@ -78,34 +74,29 @@ async def calculate_par_stock(
         else:
             return "Other"
 
-    combined["supplier"] = combined["item name"].apply(tag_supplier)
+    combined["Supplier"] = combined["item name"].apply(match_supplier)
+    combined["Item"] = combined["item name"].str.upper()
+    combined["Stock in Hand"] = 0
+    combined["Expected Delivery"] = 0
 
-    # Display formatting
-    combined["item"] = combined["item name"].str.upper()
-    combined["stock in hand"] = 0
-    combined["expected delivery"] = 0
-
-    # Final Stock Needed Logic
-    def calc_final(suggested, stock, delivery):
-        total = stock + delivery
-        if total < suggested:
-            return round(suggested + (suggested - total), 2)
-        else:
-            return round(max(0, suggested - (total - suggested)), 2)
-
-    combined["final stock needed"] = combined.apply(
-        lambda row: calc_final(row["suggested par"], row["stock in hand"], row["expected delivery"]),
+    # Final Stock Needed Calculation
+    combined["Total Available"] = combined["Stock in Hand"] + combined["Expected Delivery"]
+    combined["Final Stock Needed"] = combined.apply(
+        lambda row: round(
+            row["Suggested Par"] + max(0, row["Suggested Par"] - row["Total Available"])
+            if row["Total Available"] < row["Suggested Par"]
+            else max(0, row["Suggested Par"] - (row["Total Available"] - row["Suggested Par"])),
+            2
+        ),
         axis=1
     )
 
-    result = combined[[
-        "item", "item code", "unit", "suggested par",
-        "stock in hand", "expected delivery",
-        "final stock needed", "supplier"
+    output = combined[[
+        "Item", "Item Code", "Unit", "Suggested Par",
+        "Stock in Hand", "Expected Delivery", "Final Stock Needed", "Supplier"
     ]]
 
-    return {"result": result.to_dict(orient="records")}
-
+    return {"result": output.to_dict(orient="records")}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
