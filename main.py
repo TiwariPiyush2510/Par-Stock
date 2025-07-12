@@ -1,23 +1,15 @@
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Or replace "*" with ["https://preeminent-choux-a8ea17.netlify.app"]
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
-import io
+from io import BytesIO
 
 app = FastAPI()
 
-# Allow CORS for frontend
+# ✅ Enable CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # You can restrict this to Netlify URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,69 +17,44 @@ app.add_middleware(
 
 @app.post("/calculate_par_stock/")
 async def calculate_par_stock(
-    monthly_file: UploadFile = File(...),
     weekly_file: UploadFile = File(...),
+    monthly_file: UploadFile = File(...),
     barakat_file: UploadFile = File(None),
     ofi_file: UploadFile = File(None)
 ):
     try:
-        # Read uploaded files
-        monthly_df = pd.read_excel(monthly_file.file)
-        weekly_df = pd.read_excel(weekly_file.file)
+        # Read uploaded Excel files
+        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
 
-        # Clean column names
-        monthly_df.columns = monthly_df.columns.str.strip()
-        weekly_df.columns = weekly_df.columns.str.strip()
+        # Calculate daily avg from weekly and monthly
+        weekly_avg = weekly_df.groupby("Item Name")["Consumption"].sum() / 7
+        monthly_avg = monthly_df.groupby("Item Name")["Consumption"].sum() / 30
+        suggested_par = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1)
 
-        # Merge and compute average daily usage
-        merged = pd.merge(monthly_df, weekly_df, on="Item Name", how="outer", suffixes=('_monthly', '_weekly')).fillna(0)
-        merged["Monthly Avg"] = merged["Total Consumption_monthly"] / merged["Days_monthly"]
-        merged["Weekly Avg"] = merged["Total Consumption_weekly"] / merged["Days_weekly"]
-        merged["Suggested Par"] = merged[["Monthly Avg", "Weekly Avg"]].max(axis=1).round(2)
-
-        # Read supplier files
-        barakat_items = []
-        ofi_items = []
-
-        if barakat_file:
-            barakat_df = pd.read_excel(barakat_file.file)
-            barakat_items = barakat_df["Item Name"].str.strip().str.lower().tolist()
-
-        if ofi_file:
-            ofi_df = pd.read_excel(ofi_file.file)
-            ofi_items = ofi_df["Item Name"].str.strip().str.lower().tolist()
-
-        # Assign suppliers
-        def get_supplier(item_name):
-            name = item_name.strip().lower()
-            if name in barakat_items:
-                return "Barakat"
-            elif name in ofi_items:
-                return "OFI"
-            else:
-                return ""
-
-        merged["Supplier"] = merged["Item Name"].apply(get_supplier)
-
-        # Build response
-        final_data = []
-        for _, row in merged.iterrows():
-            item = row["Item Name"]
-            code = row.get("Item Code", "")
-            unit = row.get("Unit", "")
-            par = row["Suggested Par"]
-
-            final_data.append({
+        result = []
+        for item, par in suggested_par.items():
+            result.append({
                 "Item": item,
-                "Item Code": code,
-                "Unit": unit,
                 "Suggested Par": round(par, 2),
                 "Stock in Hand": 0,
-                "Final Stock Needed": round(par, 2),  # Initially same as par
-                "Supplier": row["Supplier"]
+                "Expected Delivery": 0,
+                "Final Stock Needed": round(par, 2),
+                "Supplier": ""
             })
 
-        return JSONResponse(content=final_data)
+        df_result = pd.DataFrame(result)
+
+        # Supplier mapping by Item Name (Barakat / OFI)
+        if barakat_file:
+            barakat_items = pd.read_excel(BytesIO(await barakat_file.read()))["Item Name"].str.lower().tolist()
+            df_result.loc[df_result["Item"].str.lower().isin(barakat_items), "Supplier"] = "Barakat"
+
+        if ofi_file:
+            ofi_items = pd.read_excel(BytesIO(await ofi_file.read()))["Item Name"].str.lower().tolist()
+            df_result.loc[df_result["Item"].str.lower().isin(ofi_items), "Supplier"] = "OFI"
+
+        return {"result": df_result.to_dict(orient="records")}
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=422, content={"error": str(e)})
