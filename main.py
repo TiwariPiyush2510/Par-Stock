@@ -1,100 +1,114 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from typing import List
 import pandas as pd
-import io
+import uvicorn
+import os
+from io import BytesIO
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or specify frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-supplier_data_cache = {}
+# Unit conversion map (extend this as needed)
+unit_conversion = {
+    'CASE': {'KGS': 10, 'PCS': 24},
+    'CS': {'KGS': 10, 'PCS': 24},
+    'CS_24PCS': {'PCS': 24},
+    'CS_6KGS': {'KGS': 6},
+    'CS_10KGS': {'KGS': 10},
+    'CS_12.5 KGS': {'KGS': 12.5},
+    '5X2.5 KG': {'KGS': 12.5},
+    '4 x 2.5 KG': {'KGS': 10},
+    'EACH': {'EACH': 1}
+}
 
-def read_file(upload_file: UploadFile):
-    filename = upload_file.filename.lower()
-    content = upload_file.file.read()
-    upload_file.file.seek(0)
+def convert_unit(supplier_unit, target_unit):
+    for base_unit, conversions in unit_conversion.items():
+        if supplier_unit.upper().strip() == base_unit.upper().strip():
+            return conversions.get(target_unit.upper().strip(), 1)
+    return 1
 
-    if filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
+
+def read_file(file: UploadFile):
+    filename = file.filename.lower()
+    content = file.file.read()
+    if filename.endswith('.csv'):
+        df = pd.read_csv(BytesIO(content))
     else:
-        df = pd.read_excel(io.BytesIO(content))
+        df = pd.read_excel(BytesIO(content))
     return df
+
+
+def normalize_item_name(name):
+    return str(name).strip().lower()
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    supplier_file: UploadFile = File(None)
+    supplier_file: UploadFile = File(None),
 ):
     try:
         weekly_df = read_file(weekly_file)
         monthly_df = read_file(monthly_file)
-        supplier_df = None
-        supplier_name = "Unknown"
+        supplier_df = read_file(supplier_file) if supplier_file else pd.DataFrame()
 
-        if supplier_file:
-            supplier_df = read_file(supplier_file)
-            filename_lower = supplier_file.filename.lower()
+        # Normalize and calculate daily average
+        weekly_df['Item Name'] = weekly_df['Item Name'].apply(normalize_item_name)
+        monthly_df['Item Name'] = monthly_df['Item Name'].apply(normalize_item_name)
 
-            supplier_map = {
-                "barakat": "Barakat",
-                "ofi": "OFI",
-                "al ahlia": "Al Ahlia",
-                "emirates": "Emirates",
-                "harvey": "Harvey"
-            }
+        weekly_avg = weekly_df.groupby('Item Name')['Quantity'].sum() / 7
+        monthly_avg = monthly_df.groupby('Item Name')['Quantity'].sum() / 30
 
-            for key, name in supplier_map.items():
-                if key in filename_lower:
-                    supplier_name = name
-                    break
+        suggested_par = pd.concat([weekly_avg, monthly_avg], axis=1)
+        suggested_par.columns = ['Weekly', 'Monthly']
+        suggested_par['Suggested Par'] = suggested_par.max(axis=1).round(2)
+        suggested_par.reset_index(inplace=True)
 
-            supplier_data_cache[supplier_name] = supplier_df
+        # Add back additional columns for matching
+        result = pd.merge(suggested_par, monthly_df.drop_duplicates('Item Name'), on='Item Name', how='left')
 
-        # Merge weekly and monthly data on Item
-        weekly_df = weekly_df.rename(columns=lambda x: x.strip())
-        monthly_df = monthly_df.rename(columns=lambda x: x.strip())
-        merged_df = pd.merge(weekly_df, monthly_df, on="Item", suffixes=("_weekly", "_monthly"))
+        # Supplier match
+        if not supplier_df.empty:
+            supplier_df['Item Name'] = supplier_df['Item Name'].apply(normalize_item_name)
+            supplier_df['Supplier Unit'] = supplier_df.iloc[:, 2]  # Assuming Unit is 3rd col
+            
+            result = pd.merge(result, supplier_df[['Item Name', 'Supplier Unit']], on='Item Name', how='left')
+            result['Supplier'] = os.path.splitext(supplier_file.filename)[0].split(" ")[0]
+        else:
+            result['Supplier'] = 'Unknown'
 
-        results = []
-        for _, row in merged_df.iterrows():
-            item_name = str(row["Item"]).strip()
-            item_code = row.get("Item Code", "")
-            unit = row.get("Unit", "")
-            weekly = float(row.get("Qty_weekly", 0))
-            monthly = float(row.get("Qty_monthly", 0))
+        # Calculate conversion if necessary
+        result['Conversion Factor'] = result.apply(
+            lambda row: convert_unit(row.get('Supplier Unit', ''), row.get('Unit', '')), axis=1
+        )
+        result['Suggested Par'] = (result['Suggested Par'] * result['Conversion Factor']).round(2)
 
-            daily_avg_weekly = weekly / 7
-            daily_avg_monthly = monthly / 30
-            suggested_par = max(daily_avg_weekly, daily_avg_monthly)
-
-            supplier_match = "Unknown"
-            for sup_name, sup_df in supplier_data_cache.items():
-                sup_df.columns = sup_df.columns.str.strip()
-                if "Item Name" in sup_df.columns:
-                    match = sup_df[sup_df["Item Name"].str.strip().str.lower() == item_name.lower()]
-                    if not match.empty:
-                        supplier_match = sup_name
-                        break
-
-            results.append({
-                "Item": item_name,
-                "Item Code": item_code,
-                "Unit": unit,
-                "Suggested Par": round(suggested_par, 2),
+        final = []
+        for _, row in result.iterrows():
+            final.append({
+                "Item": row.get("Item Name", ""),
+                "Item Code": row.get("Item Code", ""),
+                "Unit": row.get("Unit", ""),
+                "Suggested Par": row.get("Suggested Par", 0),
                 "Stock in Hand": 0,
                 "Expected Delivery": 0,
-                "Final Stock Needed": round(suggested_par, 2),
-                "Supplier": supplier_match
+                "Final Stock Needed": row.get("Suggested Par", 0),
+                "Supplier": row.get("Supplier", "Unknown")
             })
 
-        return JSONResponse(content=results)
+        return final
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"error": str(e)}
+
+# For local testing
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
