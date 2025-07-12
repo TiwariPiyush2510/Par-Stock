@@ -1,14 +1,14 @@
-# --- main.py ---
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import pandas as pd
 from typing import List
-import io
+import pandas as pd
+from io import BytesIO
+import numpy as np
+import os
 
 app = FastAPI()
 
-# Enable CORS
+# CORS settings
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,83 +17,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Conversion logic
-unit_conversion = {
-    "CS_24PCS": 24,
-    "CS_6BTL": 6,
-    "CS_24BTL": 24,
-    "CS_12BTL": 12,
-    "BIB_10LTR": 10,
-    "BIB_19LTR": 19,
-    "CS_24BTL X 290ML": 24,
-    "CS_1ltr x 12btls": 12,
-    # Add more if needed
-}
-
-def clean_item_name(name):
-    return str(name).strip().lower()
+def read_file(upload: UploadFile):
+    ext = os.path.splitext(upload.filename)[-1].lower()
+    if ext == ".csv":
+        return pd.read_csv(BytesIO(upload.file.read()))
+    elif ext in [".xlsx", ".xls"]:
+        return pd.read_excel(BytesIO(upload.file.read()))
+    else:
+        raise ValueError("Unsupported file format")
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    supplier_file: UploadFile = File(...)
+    supplier_file: UploadFile = File(...),
 ):
-    try:
-        weekly_df = pd.read_excel(weekly_file.file)
-        monthly_df = pd.read_excel(monthly_file.file)
+    weekly_df = read_file(weekly_file)
+    monthly_df = read_file(monthly_file)
+    supplier_df = read_file(supplier_file)
 
-        # Support CSV or Excel for supplier
-        if supplier_file.filename.endswith(".csv"):
-            supplier_df = pd.read_csv(supplier_file.file)
+    # Clean and standardize
+    for df in [weekly_df, monthly_df]:
+        df["Item Name"] = df["Item Name"].astype(str).str.upper().str.strip()
+        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+
+    supplier_df["Item Name"] = supplier_df["Item Name"].astype(str).str.upper().str.strip()
+
+    # Calculate daily averages
+    weekly_avg = weekly_df.groupby("Item Name")["Quantity"].sum() / 7
+    monthly_avg = monthly_df.groupby("Item Name")["Quantity"].sum() / 30
+
+    par_stock = pd.concat([weekly_avg, monthly_avg], axis=1)
+    par_stock.columns = ["Weekly Avg", "Monthly Avg"]
+    par_stock["Suggested Par"] = par_stock.max(axis=1)
+
+    # Match items from supplier list
+    result = []
+
+    for _, row in par_stock.reset_index().iterrows():
+        item_name = row["Item Name"]
+        suggested_par = row["Suggested Par"]
+
+        # Try to find matching item in supplier file
+        match = supplier_df[supplier_df["Item Name"].str.upper().str.strip() == item_name]
+        if match.empty:
+            # Try partial match
+            match = supplier_df[supplier_df["Item Name"].str.contains(item_name[:8], na=False)]
+
+        if not match.empty:
+            supplier_row = match.iloc[0]
+            item_code = supplier_row.get("Item Code", "")
+            unit = supplier_row.get("Unit", "")
+            supplier_name = detect_supplier_name(supplier_file.filename)
         else:
-            supplier_df = pd.read_excel(supplier_file.file)
+            item_code = ""
+            unit = ""
+            supplier_name = ""
 
-        # Clean up item names
-        weekly_df['Item Name Clean'] = weekly_df['Item Name'].apply(clean_item_name)
-        monthly_df['Item Name Clean'] = monthly_df['Item Name'].apply(clean_item_name)
-        supplier_df['Item Name Clean'] = supplier_df['Item Name'].apply(clean_item_name)
+        result.append({
+            "Item Name": item_name,
+            "Item Code": item_code,
+            "Unit": unit,
+            "Suggested Par": round(suggested_par, 2),
+            "Stock in Hand": 0,
+            "Expected Delivery": 0,
+            "Final Stock Needed": 0,
+            "Supplier": supplier_name
+        })
 
-        # Merge reports
-        combined_df = pd.concat([weekly_df, monthly_df])
+    return result
 
-        par_data = []
-
-        for item_name in combined_df['Item Name Clean'].unique():
-            weekly = weekly_df[weekly_df['Item Name Clean'] == item_name]['Quantity'].sum()
-            monthly = monthly_df[monthly_df['Item Name Clean'] == item_name]['Quantity'].sum()
-
-            weekly_avg = weekly / 7
-            monthly_avg = monthly / 30
-            suggested_par = round(max(weekly_avg, monthly_avg), 2)
-
-            original_row = combined_df[combined_df['Item Name Clean'] == item_name].iloc[0]
-            supplier_row = supplier_df[supplier_df['Item Name Clean'] == item_name]
-
-            item_code = original_row.get("Item Code", "")
-            unit = original_row.get("Unit", "")
-
-            # Handle supplier unit conversion
-            if not supplier_row.empty:
-                sup_unit = str(supplier_row.iloc[0].get("Unit Price", "")).strip().upper()
-                conversion_rate = unit_conversion.get(sup_unit, 1)
-                suggested_par = round(suggested_par / conversion_rate, 2)
-                supplier_name = supplier_file.filename.split(".")[0]
-            else:
-                supplier_name = "Unknown"
-
-            par_data.append({
-                "Item": original_row.get("Item Name", ""),
-                "Item Code": item_code,
-                "Unit": unit,
-                "Suggested Par": suggested_par,
-                "Stock in Hand": 0,
-                "Expected Delivery": 0,
-                "Final Stock Needed": suggested_par,
-                "Supplier": supplier_name
-            })
-
-        return JSONResponse(content=par_data)
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+def detect_supplier_name(filename: str):
+    name = filename.lower()
+    if "barakat" in name:
+        return "Barakat"
+    elif "ofi" in name:
+        return "OFI"
+    elif "ahlia" in name:
+        return "Al Ahlia"
+    elif "emirates" in name:
+        return "Emirates"
+    elif "harvey" in name:
+        return "Harvey"
+    else:
+        return "Unknown"
