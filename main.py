@@ -1,96 +1,89 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+from typing import Optional
 import uvicorn
+import os
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For production, replace with your Netlify frontend domain
+    allow_origins=["*"],  # Allow all during development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def read_file(upload: UploadFile) -> pd.DataFrame:
+def load_file(file: Optional[UploadFile]) -> pd.DataFrame:
+    if not file:
+        return pd.DataFrame()
+    filename = file.filename.lower()
     try:
-        if upload.filename.endswith(".csv"):
-            return pd.read_csv(upload.file)
+        if filename.endswith(".csv"):
+            df = pd.read_csv(file.file)
+        elif filename.endswith(".xlsx"):
+            df = pd.read_excel(file.file)
         else:
-            return pd.read_excel(upload.file)
+            return pd.DataFrame()
+        df.columns = df.columns.str.strip().str.lower()
+        return df
     except Exception as e:
-        print(f"Error reading {upload.filename}: {e}")
+        print(f"Error loading file: {e}")
         return pd.DataFrame()
 
 @app.post("/calculate_par_stock")
-async def calculate_par_stock(
+async def calculate(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    barakat_file: UploadFile = File(None),
-    ofi_file: UploadFile = File(None),
-    ahlia_file: UploadFile = File(None),
-    epoultry_file: UploadFile = File(None),
-    harvey_file: UploadFile = File(None)
+    barakat_file: Optional[UploadFile] = File(None),
+    ofi_file: Optional[UploadFile] = File(None),
+    al_ahlia_file: Optional[UploadFile] = File(None),
+    ep_file: Optional[UploadFile] = File(None),
+    hb_file: Optional[UploadFile] = File(None),
 ):
-    supplier_files = {
-        "Barakat": barakat_file,
-        "OFI": ofi_file,
-        "Al Ahlia": ahlia_file,
-        "Emirates Poultry": epoultry_file,
-        "Harvey and Brockess": harvey_file
-    }
+    # Load consumption data
+    weekly_df = load_file(weekly_file)
+    monthly_df = load_file(monthly_file)
 
-    weekly_df = read_file(weekly_file)
-    monthly_df = read_file(monthly_file)
-
-    weekly_df.columns = weekly_df.columns.str.strip().str.lower()
-    monthly_df.columns = monthly_df.columns.str.strip().str.lower()
-
-    def clean(df):
-        df = df.rename(columns={"quantity": "consumption"})
-        df = df[["item name", "item code", "unit", "consumption"]]
-        df["item name"] = df["item name"].str.strip().str.lower()
-        return df.dropna()
-
-    weekly_df = clean(weekly_df)
-    monthly_df = clean(monthly_df)
+    for df in [weekly_df, monthly_df]:
+        df.rename(columns={"quantity": "consumption"}, inplace=True)
+        df["item name"] = df["item name"].astype(str).str.lower().str.strip()
 
     weekly_df["daily"] = weekly_df["consumption"] / 7
     monthly_df["daily"] = monthly_df["consumption"] / 30
 
-    merged = pd.merge(weekly_df, monthly_df, on="item name", suffixes=("_weekly", "_monthly"), how="outer")
-    merged = merged.fillna(0)
+    combined = pd.merge(
+        weekly_df, monthly_df, on="item name", how="outer", suffixes=("_weekly", "_monthly")
+    ).fillna(0)
 
-    merged["suggested par"] = merged[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
+    combined["Suggested Par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
+    combined["Item Code"] = combined["item code_weekly"].fillna(combined["item code_monthly"])
+    combined["Unit"] = combined["unit_weekly"].fillna(combined["unit_monthly"])
+    combined["Item"] = combined["item name"].str.upper()
+    combined["Stock in Hand"] = 0
+    combined["Expected Delivery"] = 0
+    combined["Final Stock Needed"] = combined["Suggested Par"]
 
-    merged["item code"] = merged["item code_weekly"].combine_first(merged["item code_monthly"])
-    merged["unit"] = merged["unit_weekly"].combine_first(merged["unit_monthly"])
-    merged["item"] = merged["item name"].str.upper()
+    # Load supplier files
+    suppliers = {
+        "Barakat": load_file(barakat_file),
+        "OFI": load_file(ofi_file),
+        "Al Ahlia": load_file(al_ahlia_file),
+        "Emirates Poultry": load_file(ep_file),
+        "Harvey and Brockess": load_file(hb_file),
+    }
 
-    merged["stock in hand"] = 0
-    merged["expected delivery"] = 0
-    merged["final stock needed"] = merged["suggested par"]
+    for name, df in suppliers.items():
+        if not df.empty:
+            df["item name"] = df["item name"].astype(str).str.lower().str.strip()
+            combined.loc[combined["item name"].isin(df["item name"]), "Supplier"] = name
 
-    # Supplier tagging
-    def identify_supplier(name):
-        name = name.lower().strip()
-        for supplier, file in supplier_files.items():
-            if file:
-                df = read_file(file)
-                df.columns = df.columns.str.strip().str.lower()
-                if "item name" in df.columns:
-                    df["item name"] = df["item name"].astype(str).str.lower().str.strip()
-                    if name in df["item name"].values:
-                        return supplier
-        return "Other"
+    combined["Supplier"] = combined["Supplier"].fillna("Other")
 
-    merged["supplier"] = merged["item name"].apply(identify_supplier)
-
-    result = merged[[
-        "item", "item code", "unit", "suggested par",
-        "stock in hand", "expected delivery",
-        "final stock needed", "supplier"
+    result = combined[[
+        "Item", "Item Code", "Unit", "Suggested Par", "Stock in Hand",
+        "Expected Delivery", "Final Stock Needed", "Supplier"
     ]]
 
     return {"result": result.to_dict(orient="records")}
