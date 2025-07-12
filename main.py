@@ -1,89 +1,88 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from typing import List, Optional
 import pandas as pd
 import io
 
 app = FastAPI()
 
-# Enable CORS
+# CORS for Netlify
+origins = ["https://preeminent-choux-a8ea17.netlify.app"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-supplier_data = {}
+# Store supplier items in memory
+supplier_items = {}
 
-def read_excel_or_csv(file: UploadFile):
-    content = file.file.read()
+def read_excel_or_csv(upload_file: UploadFile) -> pd.DataFrame:
+    content = upload_file.file.read()
     try:
         return pd.read_excel(io.BytesIO(content))
-    except Exception:
-        return pd.read_csv(io.StringIO(content.decode("utf-8")))
+    except:
+        return pd.read_csv(io.BytesIO(content))
+
+def get_daily_average(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(subset=["Item Name", "Quantity"])
+    grouped = df.groupby("Item Name")["Quantity"].sum().reset_index()
+    grouped["Daily Avg"] = grouped["Quantity"] / 7
+    return grouped[["Item Name", "Daily Avg"]]
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    barakat_file: UploadFile = File(None),
-    ofi_file: UploadFile = File(None),
-    al_ahlia_file: UploadFile = File(None),
-    emirates_file: UploadFile = File(None),
-    harvey_file: UploadFile = File(None),
+    barakat_file: Optional[UploadFile] = File(None),
+    ofi_file: Optional[UploadFile] = File(None),
+    alAhlia_file: Optional[UploadFile] = File(None),
+    emirates_file: Optional[UploadFile] = File(None),
+    harvey_file: Optional[UploadFile] = File(None),
 ):
-    weekly_df = read_excel_or_csv(weekly_file)
-    monthly_df = read_excel_or_csv(monthly_file)
+    # Step 1: Read consumption files
+    weekly_df = get_daily_average(read_excel_or_csv(weekly_file))
+    monthly_df = get_daily_average(read_excel_or_csv(monthly_file))
 
-    # Preprocess & merge
-    for df in [weekly_df, monthly_df]:
-        df.columns = df.columns.str.strip()
-    weekly_df = weekly_df.rename(columns={"Item Name": "Item"})
-    monthly_df = monthly_df.rename(columns={"Item Name": "Item"})
+    # Step 2: Use higher of weekly/monthly average
+    merged = pd.merge(weekly_df, monthly_df, on="Item Name", how="outer").fillna(0)
+    merged["Suggested Par"] = merged[["Daily Avg_x", "Daily Avg_y"]].max(axis=1)
+    merged = merged[["Item Name", "Suggested Par"]]
 
-    weekly_avg = weekly_df.groupby("Item")["Quantity"].mean() / 7
-    monthly_avg = monthly_df.groupby("Item")["Quantity"].mean() / 30
-    suggested_par = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1).reset_index()
-    suggested_par.columns = ["Item", "Suggested Par"]
-
-    # Attach supplier info
-    def process_supplier(file, name):
-        if file:
-            df = read_excel_or_csv(file)
-            df.columns = df.columns.str.strip()
-            df["Supplier"] = name
-            supplier_data[name] = df
-            return df
-        return pd.DataFrame()
-
-    suppliers = {
+    # Step 3: Combine with supplier items
+    supplier_data = {
         "Barakat": barakat_file,
         "OFI": ofi_file,
-        "Al Ahlia": al_ahlia_file,
+        "Al Ahlia": alAhlia_file,
         "Emirates Poultry": emirates_file,
-        "Harvey and Brockess": harvey_file
+        "Harvey and Brockess": harvey_file,
     }
 
-    all_items = []
-    for name, file in suppliers.items():
-        df = process_supplier(file, name)
-        if not df.empty:
-            all_items.append(df)
+    results = []
 
-    merged = pd.concat(all_items, ignore_index=True) if all_items else pd.DataFrame(columns=["Item"])
+    for supplier_name, supplier_file in supplier_data.items():
+        if supplier_file:
+            df = read_excel_or_csv(supplier_file)
+            supplier_items[supplier_name] = df  # cache for filtering
 
-    if merged.empty:
-        return {"error": "No supplier data provided."}
+            for _, row in df.iterrows():
+                item_name = str(row.get("Item Name")).strip()
+                unit = row.get("Unit", "")
+                code = row.get("Item Code", "")
 
-    merged["Item"] = merged["Item"].str.strip().str.upper()
-    suggested_par["Item"] = suggested_par["Item"].str.strip().str.upper()
+                par_row = merged[merged["Item Name"].str.strip().str.lower() == item_name.lower()]
+                if not par_row.empty:
+                    suggested_par = float(par_row["Suggested Par"].values[0])
+                    results.append({
+                        "Item": item_name,
+                        "Item Code": code,
+                        "Unit": unit,
+                        "Suggested Par": round(suggested_par, 2),
+                        "Stock in Hand": 0,
+                        "Expected Delivery": 0,
+                        "Final Stock Needed": round(suggested_par, 2),
+                        "Supplier": supplier_name
+                    })
 
-    result = pd.merge(merged, suggested_par, on="Item", how="left")
-    result["Suggested Par"] = result["Suggested Par"].fillna(0)
-    result["Stock in Hand"] = 0
-    result["Expected Delivery"] = 0
-
-    result["Final Stock Needed"] = result["Suggested Par"]  # default until frontend fills in values
-
-    return result.to_dict(orient="records")
+    return results
