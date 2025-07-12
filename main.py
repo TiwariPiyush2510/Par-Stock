@@ -1,11 +1,13 @@
-from fastapi import FastAPI, UploadFile, File
+# main.py (FastAPI Backend)
+
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
 from typing import List
+import pandas as pd
+import uvicorn
 
 app = FastAPI()
 
-# Allow frontend access (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,84 +16,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def load_excel(file: UploadFile) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(file.file)
+        return df
+    except Exception as e:
+        print(f"Failed to read {file.filename}: {e}")
+        return pd.DataFrame()
+
+
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    barakat_file: UploadFile = File(None),
-    ofi_file: UploadFile = File(None)
+    barakat_file: UploadFile = File(...),
+    ofi_file: UploadFile = File(...)
 ):
-    try:
-        # Read uploaded Excel files
-        weekly_df = pd.read_excel(weekly_file.file)
-        monthly_df = pd.read_excel(monthly_file.file)
+    # Load files
+    weekly_df = load_excel(weekly_file)
+    monthly_df = load_excel(monthly_file)
+    barakat_df = load_excel(barakat_file)
+    ofi_df = load_excel(ofi_file)
 
-        # Check for required column
-        if "Quantity" not in weekly_df.columns or "Quantity" not in monthly_df.columns:
-            return {"error": "Column not found: Quantity"}
+    # Normalize columns
+    for df in [weekly_df, monthly_df]:
+        df.columns = df.columns.str.strip().str.lower()
 
-        # Group by item and average daily consumption
-        def get_daily_average(df):
-            grouped = df.groupby("Item Name")["Quantity"].sum().reset_index()
-            return grouped
+    for df in [barakat_df, ofi_df]:
+        df.columns = df.columns.str.strip().str.lower()
+        if "item name" not in df.columns:
+            return {"error": "Item Name column missing in supplier template"}
+        df["item name"] = df["item name"].astype(str).str.strip().str.lower()
 
-        weekly_avg = get_daily_average(weekly_df)
-        weekly_avg["Weekly Avg"] = weekly_avg["Quantity"] / 7
-        monthly_avg = get_daily_average(monthly_df)
-        monthly_avg["Monthly Avg"] = monthly_avg["Quantity"] / 30
+    # Aggregate consumption
+    def clean(df):
+        df = df.rename(columns={"quantity": "Consumption"})
+        df = df[["item name", "item code", "unit", "Consumption"]]
+        df = df.dropna(subset=["item name"])
+        df["item name"] = df["item name"].astype(str).str.strip().str.lower()
+        return df
 
-        merged = pd.merge(weekly_avg[["Item Name", "Weekly Avg"]],
-                          monthly_avg[["Item Name", "Monthly Avg"]],
-                          on="Item Name", how="outer")
+    weekly_df = clean(weekly_df)
+    monthly_df = clean(monthly_df)
 
-        # Suggested Par = higher of the two averages
-        merged["Suggested Par"] = merged[["Weekly Avg", "Monthly Avg"]].max(axis=1)
+    weekly_avg = weekly_df.copy()
+    weekly_avg["daily"] = weekly_avg["consumption"] / 7
 
-        # Merge in full details (Item Code, Unit, etc.) from monthly file
-        full_details = monthly_df.drop_duplicates(subset="Item Name")[["Item Name", "Item Code", "Unit"]]
-        final_df = pd.merge(merged, full_details, on="Item Name", how="left")
+    monthly_avg = monthly_df.copy()
+    monthly_avg["daily"] = monthly_avg["consumption"] / 30
 
-        # Prepare output
-        result = []
-        for _, row in final_df.iterrows():
-            item_name = row["Item Name"]
-            suggested_par = row["Suggested Par"]
+    combined = pd.merge(weekly_avg, monthly_avg, on="item name", suffixes=("_weekly", "_monthly"), how="outer")
+    combined = combined.fillna(0)
 
-            result.append({
-                "Item": item_name,
-                "Item Code": row.get("Item Code", ""),
-                "Unit": row.get("Unit", ""),
-                "Suggested Par": round(suggested_par, 2),
-                "Stock in Hand": 0,
-                "Expected Delivery": 0,
-                "Final Stock Needed": round(suggested_par, 2),
-                "Supplier": get_supplier(item_name, barakat_file, ofi_file)
-            })
+    combined["Suggested Par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
 
-        return {"result": result}
+    # Add back item code/unit from either file
+    combined["Item Code"] = combined["item code_weekly"]
+    combined["Unit"] = combined["unit_weekly"]
+    combined["Item Code"].fillna(combined["item code_monthly"], inplace=True)
+    combined["Unit"].fillna(combined["unit_monthly"], inplace=True)
 
-    except Exception as e:
-        return {"error": str(e)}
+    # Supplier tagging
+    def match_supplier(name):
+        if name in barakat_df["item name"].values:
+            return "Barakat"
+        elif name in ofi_df["item name"].values:
+            return "OFI"
+        else:
+            return "Other"
 
-def get_supplier(item_name, barakat_file, ofi_file):
-    try:
-        item_name_lower = item_name.strip().lower()
+    combined["Supplier"] = combined["item name"].apply(match_supplier)
 
-        if barakat_file:
-            barakat_df = pd.read_excel(barakat_file.file)
-            if "Item Name" in barakat_df.columns:
-                barakat_items = barakat_df["Item Name"].dropna().str.lower().tolist()
-                if item_name_lower in barakat_items:
-                    return "Barakat"
+    # Final structure
+    combined["Item"] = combined["item name"].str.upper()
+    combined["Stock in Hand"] = 0
+    combined["Expected Delivery"] = 0
+    combined["Final Stock Needed"] = combined["Suggested Par"]
 
-        if ofi_file:
-            ofi_df = pd.read_excel(ofi_file.file)
-            if "Item Name" in ofi_df.columns:
-                ofi_items = ofi_df["Item Name"].dropna().str.lower().tolist()
-                if item_name_lower in ofi_items:
-                    return "OFI"
+    output = combined[[
+        "Item", "Item Code", "Unit", "Suggested Par",
+        "Stock in Hand", "Expected Delivery",
+        "Final Stock Needed", "Supplier"
+    ]]
 
-        return "Other"
+    # Convert to dict
+    return {"result": output.to_dict(orient="records")}
 
-    except:
-        return "Other"
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
