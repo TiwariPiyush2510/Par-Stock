@@ -1,107 +1,100 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
-import os
+import io
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change this to your Netlify domain for security
+    allow_origins=["*"],  # or specify frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def read_file(file: UploadFile) -> pd.DataFrame:
-    filename = file.filename.lower()
-    try:
-        if filename.endswith('.csv'):
-            return pd.read_csv(file.file)
-        elif filename.endswith(('.xls', '.xlsx')):
-            return pd.read_excel(file.file)
-        else:
-            return pd.DataFrame()
-    except Exception as e:
-        print(f"Failed to read {file.filename}: {e}")
-        return pd.DataFrame()
+supplier_data_cache = {}
+
+def read_file(upload_file: UploadFile):
+    filename = upload_file.filename.lower()
+    content = upload_file.file.read()
+    upload_file.file.seek(0)
+
+    if filename.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(content))
+    else:
+        df = pd.read_excel(io.BytesIO(content))
+    return df
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    supplier_file: UploadFile = File(...)
+    supplier_file: UploadFile = File(None)
 ):
-    weekly_df = read_file(weekly_file)
-    monthly_df = read_file(monthly_file)
-    supplier_df = read_file(supplier_file)
+    try:
+        weekly_df = read_file(weekly_file)
+        monthly_df = read_file(monthly_file)
+        supplier_df = None
+        supplier_name = "Unknown"
 
-    # Normalize column names
-    for df in [weekly_df, monthly_df, supplier_df]:
-        df.columns = df.columns.str.strip().str.lower()
+        if supplier_file:
+            supplier_df = read_file(supplier_file)
+            filename_lower = supplier_file.filename.lower()
 
-    # Clean consumption data
-    def clean(df):
-        df = df.rename(columns={"quantity": "consumption"})
-        df = df[["item name", "item code", "unit", "consumption"]]
-        df["item name"] = df["item name"].astype(str).str.strip().str.lower()
-        return df.dropna(subset=["item name"])
+            supplier_map = {
+                "barakat": "Barakat",
+                "ofi": "OFI",
+                "al ahlia": "Al Ahlia",
+                "emirates": "Emirates",
+                "harvey": "Harvey"
+            }
 
-    weekly_df = clean(weekly_df)
-    monthly_df = clean(monthly_df)
+            for key, name in supplier_map.items():
+                if key in filename_lower:
+                    supplier_name = name
+                    break
 
-    weekly_df["daily"] = weekly_df["consumption"] / 7
-    monthly_df["daily"] = monthly_df["consumption"] / 30
+            supplier_data_cache[supplier_name] = supplier_df
 
-    combined = pd.merge(weekly_df, monthly_df, on="item name", suffixes=("_weekly", "_monthly"), how="outer").fillna(0)
-    combined["suggested par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
+        # Merge weekly and monthly data on Item
+        weekly_df = weekly_df.rename(columns=lambda x: x.strip())
+        monthly_df = monthly_df.rename(columns=lambda x: x.strip())
+        merged_df = pd.merge(weekly_df, monthly_df, on="Item", suffixes=("_weekly", "_monthly"))
 
-    # Backfill item code and unit
-    combined["item code"] = combined["item code_weekly"].combine_first(combined["item code_monthly"])
-    combined["unit"] = combined["unit_weekly"].combine_first(combined["unit_monthly"])
+        results = []
+        for _, row in merged_df.iterrows():
+            item_name = str(row["Item"]).strip()
+            item_code = row.get("Item Code", "")
+            unit = row.get("Unit", "")
+            weekly = float(row.get("Qty_weekly", 0))
+            monthly = float(row.get("Qty_monthly", 0))
 
-    # Normalize supplier data
-    supplier_df["item name"] = supplier_df["item name"].astype(str).str.strip().str.lower()
+            daily_avg_weekly = weekly / 7
+            daily_avg_monthly = monthly / 30
+            suggested_par = max(daily_avg_weekly, daily_avg_monthly)
 
-    # Detect supplier name
-    supplier_name = "Unknown"
-    for known in ["barakat", "ofi", "al ahlia", "emirates poultry", "harvey and brockess"]:
-        if known in supplier_file.filename.lower():
-            supplier_name = known.title()
-            break
+            supplier_match = "Unknown"
+            for sup_name, sup_df in supplier_data_cache.items():
+                sup_df.columns = sup_df.columns.str.strip()
+                if "Item Name" in sup_df.columns:
+                    match = sup_df[sup_df["Item Name"].str.strip().str.lower() == item_name.lower()]
+                    if not match.empty:
+                        supplier_match = sup_name
+                        break
 
-    # Match items to supplier
-    combined["supplier"] = combined["item name"].apply(
-        lambda x: supplier_name if x in supplier_df["item name"].values else "Other"
-    )
+            results.append({
+                "Item": item_name,
+                "Item Code": item_code,
+                "Unit": unit,
+                "Suggested Par": round(suggested_par, 2),
+                "Stock in Hand": 0,
+                "Expected Delivery": 0,
+                "Final Stock Needed": round(suggested_par, 2),
+                "Supplier": supplier_match
+            })
 
-    # Convert UOM if needed (e.g. from supplier CASE to KG)
-    uom_map = {}
-    if "unit" in supplier_df.columns:
-        for _, row in supplier_df.iterrows():
-            uom_map[row["item name"]] = row["unit"]
-
-    # Optionally: apply conversion factor if needed
-    # (e.g. if CASE needs to be converted to KG based on mapping)
-    # This example assumes supplier unit is correct but you can enhance this
-
-    combined["item"] = combined["item name"].str.upper()
-    combined["stock in hand"] = 0
-    combined["expected delivery"] = 0
-
-    def calculate_final(row):
-        par = row["suggested par"]
-        total_stock = row["stock in hand"] + row["expected delivery"]
-        if total_stock < par:
-            return round(par + (par - total_stock), 2)
-        else:
-            return round(max(0, par - (total_stock - par)), 2)
-
-    combined["final stock needed"] = combined.apply(calculate_final, axis=1)
-
-    output = combined[[
-        "item", "item code", "unit", "suggested par",
-        "stock in hand", "expected delivery", "final stock needed", "supplier"
-    ]]
-
-    return output.to_dict(orient="records")
+        return JSONResponse(content=results)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
