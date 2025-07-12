@@ -1,21 +1,20 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import pandas as pd
-from io import BytesIO
+from typing import List
 
 app = FastAPI()
 
-# ✅ Enable CORS for frontend access
+# Allow frontend access (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this to Netlify URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/calculate_par_stock/")
+@app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
@@ -24,37 +23,75 @@ async def calculate_par_stock(
 ):
     try:
         # Read uploaded Excel files
-        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
-        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
+        weekly_df = pd.read_excel(weekly_file.file)
+        monthly_df = pd.read_excel(monthly_file.file)
 
-        # Calculate daily avg from weekly and monthly
-        weekly_avg = weekly_df.groupby("Item Name")["Consumption"].sum() / 7
-        monthly_avg = monthly_df.groupby("Item Name")["Consumption"].sum() / 30
-        suggested_par = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1)
+        # Check for required column
+        if "Quantity" not in weekly_df.columns or "Quantity" not in monthly_df.columns:
+            return {"error": "Column not found: Quantity"}
 
+        # Group by item and average daily consumption
+        def get_daily_average(df):
+            grouped = df.groupby("Item Name")["Quantity"].sum().reset_index()
+            return grouped
+
+        weekly_avg = get_daily_average(weekly_df)
+        weekly_avg["Weekly Avg"] = weekly_avg["Quantity"] / 7
+        monthly_avg = get_daily_average(monthly_df)
+        monthly_avg["Monthly Avg"] = monthly_avg["Quantity"] / 30
+
+        merged = pd.merge(weekly_avg[["Item Name", "Weekly Avg"]],
+                          monthly_avg[["Item Name", "Monthly Avg"]],
+                          on="Item Name", how="outer")
+
+        # Suggested Par = higher of the two averages
+        merged["Suggested Par"] = merged[["Weekly Avg", "Monthly Avg"]].max(axis=1)
+
+        # Merge in full details (Item Code, Unit, etc.) from monthly file
+        full_details = monthly_df.drop_duplicates(subset="Item Name")[["Item Name", "Item Code", "Unit"]]
+        final_df = pd.merge(merged, full_details, on="Item Name", how="left")
+
+        # Prepare output
         result = []
-        for item, par in suggested_par.items():
+        for _, row in final_df.iterrows():
+            item_name = row["Item Name"]
+            suggested_par = row["Suggested Par"]
+
             result.append({
-                "Item": item,
-                "Suggested Par": round(par, 2),
+                "Item": item_name,
+                "Item Code": row.get("Item Code", ""),
+                "Unit": row.get("Unit", ""),
+                "Suggested Par": round(suggested_par, 2),
                 "Stock in Hand": 0,
                 "Expected Delivery": 0,
-                "Final Stock Needed": round(par, 2),
-                "Supplier": ""
+                "Final Stock Needed": round(suggested_par, 2),
+                "Supplier": get_supplier(item_name, barakat_file, ofi_file)
             })
 
-        df_result = pd.DataFrame(result)
-
-        # Supplier mapping by Item Name (Barakat / OFI)
-        if barakat_file:
-            barakat_items = pd.read_excel(BytesIO(await barakat_file.read()))["Item Name"].str.lower().tolist()
-            df_result.loc[df_result["Item"].str.lower().isin(barakat_items), "Supplier"] = "Barakat"
-
-        if ofi_file:
-            ofi_items = pd.read_excel(BytesIO(await ofi_file.read()))["Item Name"].str.lower().tolist()
-            df_result.loc[df_result["Item"].str.lower().isin(ofi_items), "Supplier"] = "OFI"
-
-        return {"result": df_result.to_dict(orient="records")}
+        return {"result": result}
 
     except Exception as e:
-        return JSONResponse(status_code=422, content={"error": str(e)})
+        return {"error": str(e)}
+
+def get_supplier(item_name, barakat_file, ofi_file):
+    try:
+        item_name_lower = item_name.strip().lower()
+
+        if barakat_file:
+            barakat_df = pd.read_excel(barakat_file.file)
+            if "Item Name" in barakat_df.columns:
+                barakat_items = barakat_df["Item Name"].dropna().str.lower().tolist()
+                if item_name_lower in barakat_items:
+                    return "Barakat"
+
+        if ofi_file:
+            ofi_df = pd.read_excel(ofi_file.file)
+            if "Item Name" in ofi_df.columns:
+                ofi_items = ofi_df["Item Name"].dropna().str.lower().tolist()
+                if item_name_lower in ofi_items:
+                    return "OFI"
+
+        return "Other"
+
+    except:
+        return "Other"
