@@ -1,108 +1,72 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
-import uvicorn
+from io import BytesIO
 
 app = FastAPI()
 
+# ✅ Allow your Netlify frontend origin (NO TRAILING SLASH!)
+origins = [
+    "https://preeminent-choux-a8ea17.netlify.app"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://preeminent-choux-a8ea17.netlify.app"],  # no trailing slash
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def load_excel(file: UploadFile) -> pd.DataFrame:
-    try:
-        df = pd.read_excel(file.file)
-        return df
-    except Exception as e:
-        print(f"Failed to read {file.filename}: {e}")
-        return pd.DataFrame()
 
 @app.post("/calculate_par_stock")
-async def calculate_par_stock(
-    weekly_file: UploadFile = File(...),
-    monthly_file: UploadFile = File(...),
-    barakat_file: UploadFile = File(...),
-    ofi_file: UploadFile = File(...)
-):
-    # Load files
-    weekly_df = load_excel(weekly_file)
-    monthly_df = load_excel(monthly_file)
-    barakat_df = load_excel(barakat_file)
-    ofi_df = load_excel(ofi_file)
+async def calculate_par_stock(weekly_file: UploadFile = File(...),
+                               monthly_file: UploadFile = File(...),
+                               barakat_file: UploadFile = File(...),
+                               ofi_file: UploadFile = File(...)):
+    try:
+        # Load weekly and monthly data
+        weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+        monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
 
-    # Normalize columns
-    for df in [weekly_df, monthly_df]:
-        df.columns = df.columns.str.strip().str.lower()
+        # Calculate daily averages
+        weekly_avg = weekly_df.groupby("Item")["Quantity"].sum() / 7
+        monthly_avg = monthly_df.groupby("Item")["Quantity"].sum() / 30
 
-    for df in [barakat_df, ofi_df]:
-        df.columns = df.columns.str.strip().str.lower()
-        if "item name" not in df.columns:
-            return {"error": "Item Name column missing in supplier template"}
-        df["item name"] = df["item name"].astype(str).str.strip().str.lower()
+        # Use the higher average
+        par_stock = pd.DataFrame({
+            "Suggested Par": weekly_avg.combine(monthly_avg, max)
+        })
 
-    # Clean and calculate daily avg
-    def clean(df):
-        df = df.rename(columns={"quantity": "Consumption"})
-        df = df[["item name", "item code", "unit", "Consumption"]]
-        df = df.dropna(subset=["item name"])
-        df["item name"] = df["item name"].astype(str).str.strip().str.lower()
-        return df
+        par_stock.reset_index(inplace=True)
 
-    weekly_df = clean(weekly_df)
-    monthly_df = clean(monthly_df)
+        # Add columns for frontend interaction
+        par_stock["Item Code"] = ""
+        par_stock["Unit"] = ""
+        par_stock["Stock in Hand"] = 0
+        par_stock["Expected Delivery"] = 0
+        par_stock["Final Stock Needed"] = 0
+        par_stock["Supplier"] = "Other"
 
-    weekly_df["daily"] = weekly_df["consumption"] / 7
-    monthly_df["daily"] = monthly_df["consumption"] / 30
+        # Load Barakat and OFI files
+        barakat_df = pd.read_excel(BytesIO(await barakat_file.read()))
+        ofi_df = pd.read_excel(BytesIO(await ofi_file.read()))
 
-    combined = pd.merge(weekly_df, monthly_df, on="item name", suffixes=("_weekly", "_monthly"), how="outer")
-    combined = combined.fillna(0)
+        # Clean item names for matching
+        def clean_name(name): return str(name).strip().lower()
+        barakat_items = set(barakat_df["Item Name"].dropna().map(clean_name))
+        ofi_items = set(ofi_df["Item Name"].dropna().map(clean_name))
 
-    combined["Suggested Par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
+        # Assign supplier + placeholder fields
+        for idx, row in par_stock.iterrows():
+            item_clean = clean_name(row["Item"])
+            if item_clean in barakat_items:
+                par_stock.at[idx, "Supplier"] = "Barakat"
+            elif item_clean in ofi_items:
+                par_stock.at[idx, "Supplier"] = "OFI"
 
-    combined["Item Code"] = combined["item code_weekly"]
-    combined["Unit"] = combined["unit_weekly"]
-    combined["Item Code"].fillna(combined["item code_monthly"], inplace=True)
-    combined["Unit"].fillna(combined["unit_monthly"], inplace=True)
+        return JSONResponse(content=par_stock.to_dict(orient="records"))
 
-    def match_supplier(name):
-        if name in barakat_df["item name"].values:
-            return "Barakat"
-        elif name in ofi_df["item name"].values:
-            return "OFI"
-        else:
-            return "Other"
-
-    combined["Supplier"] = combined["item name"].apply(match_supplier)
-
-    combined["Item"] = combined["item name"].str.upper()
-    combined["Stock in Hand"] = 0.0
-    combined["Expected Delivery"] = 0.0
-
-    # Final Stock Needed Logic
-    def calculate_final(row):
-        par = row["Suggested Par"]
-        stock = row["Stock in Hand"]
-        delivery = row["Expected Delivery"]
-        total = stock + delivery
-
-        if total < par:
-            return round(par + (par - total), 2)
-        else:
-            return round(max(0, par - (total - par)), 2)
-
-    combined["Final Stock Needed"] = combined.apply(calculate_final, axis=1)
-
-    output = combined[[
-        "Item", "Item Code", "Unit", "Suggested Par",
-        "Stock in Hand", "Expected Delivery",
-        "Final Stock Needed", "Supplier"
-    ]]
-
-    return {"result": output.to_dict(orient="records")}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
