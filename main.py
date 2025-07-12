@@ -3,58 +3,55 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
 from io import BytesIO
-import uvicorn
 
 app = FastAPI()
 
+# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for development; restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+def calculate_suggested_par(weekly_df, monthly_df):
+    weekly_avg = weekly_df.groupby("Item Name")["Quantity"].sum() / 7
+    monthly_avg = monthly_df.groupby("Item Name")["Quantity"].sum() / 30
+    final_avg = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1)
+    return final_avg.reset_index(name="Suggested Par")
+
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    supplier_file: UploadFile = File(...)
+    supplier_file: UploadFile = File(...),
 ):
-    try:
-        weekly_data = pd.read_excel(BytesIO(await weekly_file.read()))
-        monthly_data = pd.read_excel(BytesIO(await monthly_file.read()))
-        supplier_data = pd.read_excel(BytesIO(await supplier_file.read())) if supplier_file.filename.endswith(".xlsx") else pd.read_csv(BytesIO(await supplier_file.read()))
+    weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+    monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
 
-        weekly_avg = weekly_data.groupby("Item Name")["Quantity"].sum() / 7
-        monthly_avg = monthly_data.groupby("Item Name")["Quantity"].sum() / 30
-        combined = pd.concat([weekly_avg, monthly_avg], axis=1)
-        combined.columns = ["Weekly Avg", "Monthly Avg"]
-        combined["Suggested Par"] = combined.max(axis=1).round(2)
+    par_df = calculate_suggested_par(weekly_df, monthly_df)
 
-        # Prepare supplier file
-        supplier_data["Item Name"] = supplier_data["Item Name"].astype(str).str.strip().str.upper()
-        combined.index = combined.index.str.strip().str.upper()
-        matched = supplier_data[supplier_data["Item Name"].str.upper().isin(combined.index)]
+    supplier_ext = supplier_file.filename.split(".")[-1].lower()
+    if supplier_ext == "csv":
+        supplier_df = pd.read_csv(BytesIO(await supplier_file.read()))
+    else:
+        supplier_df = pd.read_excel(BytesIO(await supplier_file.read()))
 
-        results = []
-        for _, row in matched.iterrows():
-            item_name = row["Item Name"].strip().upper()
-            suggested_par = combined.loc[item_name, "Suggested Par"] if item_name in combined.index else 0
-            results.append({
-                "Item": row["Item Name"],
-                "Item Code": row.get("Item Code", ""),
-                "Unit": row.get("Unit", ""),
-                "Suggested Par": round(suggested_par, 2),
-                "Stock in Hand": 0,
-                "Expected Delivery": 0,
-                "Final Stock Needed": 0,
-                "Supplier": row.get("Supplier", "")
-            })
+    supplier_df["Item Name"] = supplier_df["Item Name"].str.strip().str.upper()
+    par_df["Item Name"] = par_df["Item Name"].str.strip().str.upper()
 
-        return JSONResponse(content=results)
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+    merged = pd.merge(par_df, supplier_df, on="Item Name", how="inner")
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    merged.fillna("", inplace=True)
+
+    result = merged[[
+        "Item Name", "Item Code", "Unit", "Suggested Par"
+    ]].copy()
+
+    result["Stock in Hand"] = 0
+    result["Expected Delivery"] = 0
+    result["Final Stock Needed"] = 0
+    result["Supplier"] = supplier_file.filename.split(".")[0]  # e.g., "Barakat Template" => "Barakat Template"
+
+    return JSONResponse(content=result.to_dict(orient="records"))
