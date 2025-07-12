@@ -1,88 +1,82 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
 import pandas as pd
-import io
+import os
 
 app = FastAPI()
 
-# CORS for Netlify
-origins = ["https://preeminent-choux-a8ea17.netlify.app"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # Adjust as needed for deployment
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Store supplier items in memory
-supplier_items = {}
-
-def read_excel_or_csv(upload_file: UploadFile) -> pd.DataFrame:
-    content = upload_file.file.read()
+def load_file(file: UploadFile) -> pd.DataFrame:
     try:
-        return pd.read_excel(io.BytesIO(content))
-    except:
-        return pd.read_csv(io.BytesIO(content))
-
-def get_daily_average(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.dropna(subset=["Item Name", "Quantity"])
-    grouped = df.groupby("Item Name")["Quantity"].sum().reset_index()
-    grouped["Daily Avg"] = grouped["Quantity"] / 7
-    return grouped[["Item Name", "Daily Avg"]]
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file.file)
+        else:
+            df = pd.read_excel(file.file)
+        df.columns = df.columns.str.strip().str.lower()
+        return df
+    except Exception as e:
+        print(f"Error reading file {file.filename}: {e}")
+        return pd.DataFrame()
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    barakat_file: Optional[UploadFile] = File(None),
-    ofi_file: Optional[UploadFile] = File(None),
-    alAhlia_file: Optional[UploadFile] = File(None),
-    emirates_file: Optional[UploadFile] = File(None),
-    harvey_file: Optional[UploadFile] = File(None),
+    supplier_file: UploadFile = File(...)
 ):
-    # Step 1: Read consumption files
-    weekly_df = get_daily_average(read_excel_or_csv(weekly_file))
-    monthly_df = get_daily_average(read_excel_or_csv(monthly_file))
+    weekly_df = load_file(weekly_file)
+    monthly_df = load_file(monthly_file)
+    supplier_df = load_file(supplier_file)
 
-    # Step 2: Use higher of weekly/monthly average
-    merged = pd.merge(weekly_df, monthly_df, on="Item Name", how="outer").fillna(0)
-    merged["Suggested Par"] = merged[["Daily Avg_x", "Daily Avg_y"]].max(axis=1)
-    merged = merged[["Item Name", "Suggested Par"]]
+    supplier_df["item name"] = supplier_df["item name"].astype(str).str.strip().str.lower()
 
-    # Step 3: Combine with supplier items
-    supplier_data = {
-        "Barakat": barakat_file,
-        "OFI": ofi_file,
-        "Al Ahlia": alAhlia_file,
-        "Emirates Poultry": emirates_file,
-        "Harvey and Brockess": harvey_file,
-    }
+    def clean(df):
+        df = df.rename(columns={"quantity": "consumption"})
+        df = df[["item name", "item code", "unit", "consumption"]]
+        df["item name"] = df["item name"].astype(str).str.strip().str.lower()
+        return df.dropna(subset=["item name"])
 
-    results = []
+    weekly_df = clean(weekly_df)
+    monthly_df = clean(monthly_df)
 
-    for supplier_name, supplier_file in supplier_data.items():
-        if supplier_file:
-            df = read_excel_or_csv(supplier_file)
-            supplier_items[supplier_name] = df  # cache for filtering
+    weekly_df["daily"] = weekly_df["consumption"] / 7
+    monthly_df["daily"] = monthly_df["consumption"] / 30
 
-            for _, row in df.iterrows():
-                item_name = str(row.get("Item Name")).strip()
-                unit = row.get("Unit", "")
-                code = row.get("Item Code", "")
+    combined = pd.merge(weekly_df, monthly_df, on="item name", how="outer", suffixes=("_weekly", "_monthly"))
+    combined = combined.fillna(0)
+    combined["suggested par"] = combined[["daily_weekly", "daily_monthly"]].max(axis=1).round(2)
 
-                par_row = merged[merged["Item Name"].str.strip().str.lower() == item_name.lower()]
-                if not par_row.empty:
-                    suggested_par = float(par_row["Suggested Par"].values[0])
-                    results.append({
-                        "Item": item_name,
-                        "Item Code": code,
-                        "Unit": unit,
-                        "Suggested Par": round(suggested_par, 2),
-                        "Stock in Hand": 0,
-                        "Expected Delivery": 0,
-                        "Final Stock Needed": round(suggested_par, 2),
-                        "Supplier": supplier_name
-                    })
+    combined["item code"] = combined["item code_weekly"].combine_first(combined["item code_monthly"])
+    combined["unit"] = combined["unit_weekly"].combine_first(combined["unit_monthly"])
 
-    return results
+    # Match supplier
+    def get_supplier(name):
+        if name in supplier_df["item name"].values:
+            return supplier_df[supplier_df["item name"] == name].get("supplier", pd.Series(["Unknown"])).values[0]
+        return "Unknown"
+
+    combined["supplier"] = combined["item name"].apply(get_supplier)
+
+    combined["item"] = combined["item name"].str.upper()
+    combined["stock in hand"] = 0
+    combined["expected delivery"] = 0
+    combined["final stock needed"] = combined["suggested par"]
+
+    output = combined[[
+        "item", "item code", "unit", "suggested par",
+        "stock in hand", "expected delivery", "final stock needed", "supplier"
+    ]].rename(columns={
+        "item": "Item", "item code": "Item Code", "unit": "Unit",
+        "suggested par": "Suggested Par", "stock in hand": "Stock in Hand",
+        "expected delivery": "Expected Delivery", "final stock needed": "Final Stock Needed",
+        "supplier": "Supplier"
+    })
+
+    return output.to_dict(orient="records")
