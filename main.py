@@ -1,23 +1,29 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
-from typing import List
 import uvicorn
+import os
 
 app = FastAPI()
 
+# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change this to your frontend domain in production
+    allow_origins=["*"],  # Update with frontend domain for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 def parse_file(file: UploadFile) -> pd.DataFrame:
-    if file.filename.endswith(".csv"):
+    ext = os.path.splitext(file.filename)[-1].lower()
+    if ext == ".csv":
         return pd.read_csv(file.file)
-    return pd.read_excel(file.file)
+    elif ext in [".xls", ".xlsx"]:
+        return pd.read_excel(file.file)
+    else:
+        raise ValueError("Unsupported file format")
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
@@ -25,29 +31,47 @@ async def calculate_par_stock(
     monthly_file: UploadFile = File(...),
     supplier_file: UploadFile = File(...),
 ):
-    weekly_df = parse_file(weekly_file)
-    monthly_df = parse_file(monthly_file)
-    supplier_df = parse_file(supplier_file)
+    try:
+        # Parse files
+        weekly_df = parse_file(weekly_file)
+        monthly_df = parse_file(monthly_file)
+        supplier_df = parse_file(supplier_file)
 
-    weekly_avg = weekly_df.groupby("Item Name")["Quantity"].sum() / 7
-    monthly_avg = monthly_df.groupby("Item Name")["Quantity"].sum() / 30
+        # Clean column names
+        weekly_df.columns = [str(c).strip() for c in weekly_df.columns]
+        monthly_df.columns = [str(c).strip() for c in monthly_df.columns]
+        supplier_df.columns = [str(c).strip() for c in supplier_df.columns]
 
-    suggested_par = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1).reset_index()
-    suggested_par.columns = ["Item", "Suggested Par"]
+        # Calculate daily averages
+        def daily_avg(df):
+            return df.groupby("Item")["Quantity"].sum() / 7
 
-    final_df = supplier_df.copy()
-    final_df["Item"] = final_df["Item"].str.strip().str.upper()
+        weekly_avg = daily_avg(weekly_df)
+        monthly_avg = daily_avg(monthly_df)
+        par_stock = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1).reset_index()
+        par_stock.columns = ["Item", "Suggested Par"]
 
-    merged = pd.merge(final_df, suggested_par, how="left", left_on="Item", right_on="Item")
-    merged["Suggested Par"] = merged["Suggested Par"].fillna(0)
+        # Merge with supplier data
+        result = pd.merge(par_stock, supplier_df, on="Item", how="inner")
 
-    merged = merged[["Item", "Item Code", "Unit", "Suggested Par"]]
-    merged["Stock in Hand"] = 0
-    merged["Expected Delivery"] = 0
-    merged["Final Stock Needed"] = 0
-    merged["Supplier"] = supplier_file.filename.split(".")[0]
+        # Fill defaults
+        result["Stock in Hand"] = 0
+        result["Expected Delivery"] = 0
 
-    return merged.to_dict(orient="records")
+        # Compute Final Stock Needed dynamically (initially 0)
+        result["Final Stock Needed"] = 0
+
+        # Reorder for frontend
+        columns = ["Item", "Item Code", "Unit", "Suggested Par", "Stock in Hand", "Expected Delivery", "Final Stock Needed", "Supplier"]
+        for col in columns:
+            if col not in result.columns:
+                result[col] = ""
+        result = result[columns]
+
+        return result.to_dict(orient="records")
+
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
