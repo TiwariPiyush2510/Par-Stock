@@ -1,15 +1,16 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import List
 import pandas as pd
 from io import BytesIO
 
 app = FastAPI()
 
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Change this to specific domains in production
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -18,47 +19,53 @@ app.add_middleware(
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    supplier_file: UploadFile = File(...),
+    supplier_file: UploadFile = File(...)
 ):
-    # Load all files into DataFrames
+    # Load all files
     weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
     monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
-    supplier_df = pd.read_excel(BytesIO(await supplier_file.read())) if supplier_file.filename.endswith(".xlsx") else pd.read_csv(BytesIO(await supplier_file.read()))
+    
+    try:
+        supplier_ext = supplier_file.filename.split('.')[-1]
+        if supplier_ext == 'csv':
+            supplier_df = pd.read_csv(BytesIO(await supplier_file.read()))
+        else:
+            supplier_df = pd.read_excel(BytesIO(await supplier_file.read()))
+    except:
+        return {"error": "Unable to read supplier file"}
 
-    # Clean headers
-    weekly_df.columns = [c.strip() for c in weekly_df.columns]
-    monthly_df.columns = [c.strip() for c in monthly_df.columns]
-    supplier_df.columns = [c.strip() for c in supplier_df.columns]
+    # Clean columns
+    weekly_df.columns = weekly_df.columns.str.strip()
+    monthly_df.columns = monthly_df.columns.str.strip()
+    supplier_df.columns = supplier_df.columns.str.strip()
 
-    # Daily averages
-    weekly_df["Daily Avg"] = weekly_df["Consumption"] / 7
-    monthly_df["Daily Avg"] = monthly_df["Consumption"] / 30
+    # Standardize keys
+    weekly_df.rename(columns={"Item Name": "Item", "Quantity": "Weekly Qty"}, inplace=True)
+    monthly_df.rename(columns={"Item Name": "Item", "Quantity": "Monthly Qty"}, inplace=True)
 
-    # Use higher of two averages
-    combined = pd.merge(weekly_df[["Item Name", "Item Code", "Daily Avg"]],
-                        monthly_df[["Item Name", "Item Code", "Daily Avg"]],
-                        on=["Item Name", "Item Code"], suffixes=('_weekly', '_monthly'))
-    combined["Suggested Par"] = combined[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1)
+    # Calculate daily averages
+    weekly_df["Daily Avg"] = weekly_df["Weekly Qty"] / 7
+    monthly_df["Daily Avg"] = monthly_df["Monthly Qty"] / 30
 
-    # Merge with units
-    unit_map = weekly_df[["Item Name", "Unit"]].drop_duplicates()
-    combined = pd.merge(combined, unit_map, on="Item Name", how="left")
+    # Merge both reports
+    combined = pd.merge(weekly_df[["Item", "Daily Avg"]], monthly_df[["Item", "Daily Avg"]],
+                        on="Item", how="outer", suffixes=("_weekly", "_monthly"))
 
-    # Match with supplier file by Item Name
-    supplier_df["Item Name"] = supplier_df["Item Name"].str.strip().str.upper()
-    combined["Item Name"] = combined["Item Name"].str.strip().str.upper()
-    final = pd.merge(combined, supplier_df[["Item Name"]], on="Item Name", how="inner")
+    combined["Suggested Par"] = combined[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1).round(2)
 
-    # Add supplier name column
-    supplier_name = supplier_file.filename.split(".")[0].strip().title()
-    final["Supplier"] = supplier_name
+    # Merge supplier data
+    match_column = "Item" if "Item" in supplier_df.columns else "Item Name"
+    supplier_df.rename(columns={match_column: "Item"}, inplace=True)
+    supplier_df["Item"] = supplier_df["Item"].str.strip().str.upper()
+    combined["Item"] = combined["Item"].str.strip().str.upper()
 
-    # Clean and return JSON
-    final = final[["Item Name", "Item Code", "Unit", "Suggested Par", "Supplier"]]
-    final = final.rename(columns={"Item Name": "Item"})
+    final_df = pd.merge(combined, supplier_df, on="Item", how="inner")
 
-    final["Stock in Hand"] = 0
-    final["Expected Delivery"] = 0
-    final["Final Stock Needed"] = 0
+    # Select final columns
+    final_df = final_df[["Item", "Item Code", "Unit", "Suggested Par"]]
+    final_df["Stock in Hand"] = 0
+    final_df["Expected Delivery"] = 0
+    final_df["Final Stock Needed"] = 0
+    final_df["Supplier"] = supplier_file.filename.split('.')[0].strip()
 
-    return final.to_dict(orient="records")
+    return final_df.to_dict(orient="records")
