@@ -1,80 +1,57 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from fastapi.responses import JSONResponse
 import pandas as pd
-import io
-import os
+from io import BytesIO
 
 app = FastAPI()
 
-# Allow frontend access (CORS)
+# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://preeminent-choux-a8ea17.netlify.app"],
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# UOM conversion map
-conversion_map = {
-    ("CASE", "KGS"): 10,
-    ("CASE", "PCS"): 24,
-    ("CASE", "BTL"): 6,
-    ("BOX", "PCS"): 10,
-    ("PACK", "PCS"): 12,
-    # Add more if needed
-}
-
-def convert_unit(supplier_qty, supplier_uom, report_uom):
-    if supplier_uom == report_uom:
-        return supplier_qty
-    return supplier_qty * conversion_map.get((supplier_uom, report_uom), 1)
-
-def read_file(upload: UploadFile) -> pd.DataFrame:
-    content = upload.file.read()
-    extension = os.path.splitext(upload.filename)[1].lower()
-    if extension == ".csv":
-        df = pd.read_csv(io.StringIO(content.decode("utf-8")))
-    else:
-        df = pd.read_excel(io.BytesIO(content))
-    return df
+def calculate_suggested_par(weekly_df, monthly_df):
+    weekly_avg = weekly_df.groupby("Item Name")["Quantity"].sum() / 7
+    monthly_avg = monthly_df.groupby("Item Name")["Quantity"].sum() / 30
+    final_avg = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1)
+    return final_avg.reset_index(name="Suggested Par")
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
     weekly_file: UploadFile = File(...),
     monthly_file: UploadFile = File(...),
-    supplier_file: UploadFile = File(...)
+    supplier_file: UploadFile = File(...),
 ):
-    weekly_df = read_file(weekly_file)
-    monthly_df = read_file(monthly_file)
-    supplier_df = read_file(supplier_file)
+    weekly_df = pd.read_excel(BytesIO(await weekly_file.read()))
+    monthly_df = pd.read_excel(BytesIO(await monthly_file.read()))
 
-    supplier_name = supplier_file.filename.split()[0].strip()
+    par_df = calculate_suggested_par(weekly_df, monthly_df)
 
-    weekly_avg = weekly_df.groupby("Item Name")["Quantity"].sum() / 7
-    monthly_avg = monthly_df.groupby("Item Name")["Quantity"].sum() / 30
-    suggested_par = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1).reset_index()
-    suggested_par.columns = ["Item Name", "Suggested Par"]
+    supplier_ext = supplier_file.filename.split(".")[-1].lower()
+    if supplier_ext == "csv":
+        supplier_df = pd.read_csv(BytesIO(await supplier_file.read()))
+    else:
+        supplier_df = pd.read_excel(BytesIO(await supplier_file.read()))
 
-    merged = suggested_par.merge(weekly_df[["Item Name", "Unit"]].drop_duplicates(), on="Item Name", how="left")
-    merged["Stock in Hand"] = 0
-    merged["Expected Delivery"] = 0
-
-    supplier_df.columns = supplier_df.columns.str.strip()
     supplier_df["Item Name"] = supplier_df["Item Name"].str.strip().str.upper()
-    merged["Item Name"] = merged["Item Name"].str.strip().str.upper()
+    par_df["Item Name"] = par_df["Item Name"].str.strip().str.upper()
 
-    supplier_items = supplier_df[["Item Name", "Item Code", "Unit"]].drop_duplicates()
-    final_df = pd.merge(merged, supplier_items, on="Item Name", how="left")
+    merged = pd.merge(par_df, supplier_df, on="Item Name", how="inner")
 
-    # Reorder and fill
-    final_df["Supplier"] = supplier_name
-    final_df["Final Stock Needed"] = 0
+    merged.fillna("", inplace=True)
 
-    final_df = final_df[
-        ["Item Name", "Item Code", "Unit", "Suggested Par", "Stock in Hand", "Expected Delivery", "Final Stock Needed", "Supplier"]
-    ]
+    result = merged[[
+        "Item Name", "Item Code", "Unit", "Suggested Par"
+    ]].copy()
 
-    final_df.fillna({"Item Code": "", "Unit": ""}, inplace=True)
+    result["Stock in Hand"] = 0
+    result["Expected Delivery"] = 0
+    result["Final Stock Needed"] = 0
+    result["Supplier"] = supplier_file.filename.split(".")[0]  # e.g., "Barakat Template" => "Barakat Template"
 
-    return final_df.to_dict(orient="records")
+    return JSONResponse(content=result.to_dict(orient="records"))
