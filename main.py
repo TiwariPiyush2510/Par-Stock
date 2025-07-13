@@ -21,8 +21,7 @@ def read_file(upload: UploadFile):
         return pd.read_csv(upload.file)
     elif filename.endswith(".xlsx"):
         return pd.read_excel(upload.file)
-    else:
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
@@ -30,13 +29,25 @@ async def calculate_par_stock(
     monthly_file: UploadFile = File(...),
     supplier_file: UploadFile = File(...)
 ):
+    # Read files
     weekly_df = read_file(weekly_file)
     monthly_df = read_file(monthly_file)
     supplier_df = read_file(supplier_file)
 
+    # Clean column names
+    weekly_df.columns = weekly_df.columns.str.strip()
+    monthly_df.columns = monthly_df.columns.str.strip()
+    supplier_df.columns = supplier_df.columns.str.strip()
+
+    # Calculate Daily Averages
+    weekly_df["Item Name"] = weekly_df["Item Name"].astype(str).str.strip().str.lower()
+    monthly_df["Item Name"] = monthly_df["Item Name"].astype(str).str.strip().str.lower()
+    supplier_df["Item Name"] = supplier_df["Item Name"].astype(str).str.strip().str.lower()
+
     weekly_df["Daily Avg"] = weekly_df["Quantity"] / 7
     monthly_df["Daily Avg"] = monthly_df["Quantity"] / 30
 
+    # Merge weekly and monthly
     merged = pd.merge(
         weekly_df[["Item Name", "Daily Avg"]],
         monthly_df[["Item Name", "Daily Avg"]],
@@ -47,25 +58,25 @@ async def calculate_par_stock(
 
     merged["Suggested Par"] = merged[["Daily Avg_weekly", "Daily Avg_monthly"]].max(axis=1)
 
-    if "Item Name" in supplier_df.columns:
-        supplier_df["Item Name"] = supplier_df["Item Name"].str.strip().str.lower()
-        merged["Item Name"] = merged["Item Name"].str.strip().str.lower()
+    # Merge with supplier
+    required_cols = {"Item Name", "Item Code", "Unit"}
+    if not required_cols.issubset(set(supplier_df.columns)):
+        return JSONResponse(content={"error": "Missing required columns in supplier file"}, status_code=400)
 
-        final = pd.merge(
-            merged,
-            supplier_df,
-            on="Item Name",
-            how="inner"
-        )
+    final = pd.merge(
+        merged,
+        supplier_df[["Item Name", "Item Code", "Unit"]],
+        on="Item Name",
+        how="inner"
+    )
 
-        final["Suggested Par"] = final["Suggested Par"].round(2)
-        result = final[["Item Name", "Item Code", "Unit", "Suggested Par"]].copy()
-        result["Stock in Hand"] = 0
-        result["Expected Delivery"] = 0
-        result["Final Stock Needed"] = 0
-        result["Supplier"] = os.path.splitext(supplier_file.filename)[0].split(" ")[0]
+    final["Suggested Par"] = final["Suggested Par"].round(2)
 
-        result.rename(columns={"Item Name": "Item"}, inplace=True)
-        return JSONResponse(content=result.to_dict(orient="records"))
+    # Prepare result
+    result = final.rename(columns={"Item Name": "Item"})[["Item", "Item Code", "Unit", "Suggested Par"]]
+    result["Stock in Hand"] = 0
+    result["Expected Delivery"] = 0
+    result["Final Stock Needed"] = 0
+    result["Supplier"] = os.path.splitext(supplier_file.filename)[0].split(" ")[0]
 
-    return JSONResponse(content={"error": "Supplier file format invalid"}, status_code=400)
+    return JSONResponse(content=result.to_dict(orient="records"))
