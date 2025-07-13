@@ -1,28 +1,27 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from typing import List
 import pandas as pd
+from io import BytesIO
 import uvicorn
-import os
 
 app = FastAPI()
 
+# Allow CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def parse_file(file: UploadFile) -> pd.DataFrame:
-    ext = os.path.splitext(file.filename)[-1].lower()
-    if ext == ".csv":
-        return pd.read_csv(file.file)
-    elif ext in [".xls", ".xlsx"]:
-        return pd.read_excel(file.file)
+def read_file(file: UploadFile):
+    filename = file.filename
+    content = file.file.read()
+    if filename.endswith(".csv"):
+        return pd.read_csv(BytesIO(content))
     else:
-        raise ValueError("Unsupported file format")
+        return pd.read_excel(BytesIO(content))
 
 @app.post("/calculate_par_stock")
 async def calculate_par_stock(
@@ -30,43 +29,60 @@ async def calculate_par_stock(
     monthly_file: UploadFile = File(...),
     supplier_file: UploadFile = File(...)
 ):
-    try:
-        weekly_df = parse_file(weekly_file)
-        monthly_df = parse_file(monthly_file)
-        supplier_df = parse_file(supplier_file)
+    # Read files
+    weekly_df = read_file(weekly_file)
+    monthly_df = read_file(monthly_file)
+    supplier_df = read_file(supplier_file)
 
-        weekly_df.columns = [c.strip() for c in weekly_df.columns]
-        monthly_df.columns = [c.strip() for c in monthly_df.columns]
-        supplier_df.columns = [c.strip() for c in supplier_df.columns]
+    # Clean headers
+    weekly_df.columns = weekly_df.columns.str.strip()
+    monthly_df.columns = monthly_df.columns.str.strip()
+    supplier_df.columns = supplier_df.columns.str.strip()
 
-        # Compute daily averages
-        def daily_avg(df):
-            return df.groupby("Item")["Quantity"].sum() / 7
+    # Combine consumption data
+    def clean_consumption(df):
+        df = df.copy()
+        df.columns = df.columns.str.strip()
+        df = df.rename(columns={
+            'Item Name': 'Item',
+            'Item': 'Item',
+            'Item Code': 'Item Code',
+            'Unit': 'Unit',
+            'Quantity': 'Quantity'
+        })
+        return df[['Item', 'Unit', 'Quantity']]
 
-        weekly_avg = daily_avg(weekly_df)
-        monthly_avg = daily_avg(monthly_df)
+    weekly = clean_consumption(weekly_df)
+    monthly = clean_consumption(monthly_df)
 
-        par_df = pd.concat([weekly_avg, monthly_avg], axis=1).max(axis=1).reset_index()
-        par_df.columns = ["Item", "Suggested Par"]
+    # Compute averages
+    weekly_avg = weekly.groupby(['Item', 'Unit'])['Quantity'].mean() / 7
+    monthly_avg = monthly.groupby(['Item', 'Unit'])['Quantity'].mean() / 30
 
-        # Merge with supplier data
-        merged = pd.merge(par_df, supplier_df, on="Item", how="inner")
+    combined = pd.concat([weekly_avg, monthly_avg], axis=1).fillna(0)
+    combined['Suggested Par'] = combined.max(axis=1)
+    combined = combined.reset_index()[['Item', 'Unit', 'Suggested Par']]
 
-        # Ensure all necessary columns
-        if "Item Code" not in merged.columns:
-            merged["Item Code"] = ""
-        if "Unit" not in merged.columns:
-            merged["Unit"] = ""
+    # Match supplier items
+    supplier_df = supplier_df.rename(columns={
+        'Item Name': 'Item',
+        'Item': 'Item',
+        'Item Code': 'Item Code',
+        'Unit': 'Unit'
+    })
 
-        merged["Stock in Hand"] = 0
-        merged["Expected Delivery"] = 0
-        merged["Final Stock Needed"] = 0
-        merged["Supplier"] = os.path.splitext(supplier_file.filename)[0]
+    result = pd.merge(supplier_df, combined, on='Item', how='left')
+    result['Suggested Par'] = result['Suggested Par'].fillna(0)
+    result['Stock in Hand'] = 0
+    result['Expected Delivery'] = 0
+    result['Final Stock Needed'] = 0
 
-        return merged.to_dict(orient="records")
+    # Extract supplier name from filename
+    supplier_name = supplier_file.filename.split('.')[0].strip().split(' ')[0]
+    result['Supplier'] = supplier_name
 
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+    # Reorder columns
+    result = result[['Item', 'Item Code', 'Unit', 'Suggested Par', 'Stock in Hand', 'Expected Delivery', 'Final Stock Needed', 'Supplier']]
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Convert to dict
+    return result.to_dict(orient='records')
