@@ -10,7 +10,7 @@ app = FastAPI()
 # Allow frontend access (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://preeminent-choux-a8ea17.netlify.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
